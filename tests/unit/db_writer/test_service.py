@@ -6,12 +6,51 @@ Governance: CDB_AGENT_POLICY.md, CDB_PSM_POLICY.md
 Note: Placeholder tests marked with @pytest.mark.skip (Issue #308)
 """
 
+import importlib
 import json
+import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
 
-from services.db_writer.db_writer import DatabaseWriter
+
+def _build_prometheus_client_stub() -> types.ModuleType:
+    """Provide only the prometheus API surface needed by db_writer tests."""
+    prometheus_client = types.ModuleType("prometheus_client")
+
+    class _MetricStub:
+        def labels(self, **kwargs):
+            return self
+
+        def inc(self):
+            return None
+
+        def set_function(self, func):
+            return None
+
+    prometheus_client.Counter = lambda *args, **kwargs: _MetricStub()
+    prometheus_client.Gauge = lambda *args, **kwargs: _MetricStub()
+    prometheus_client.start_http_server = lambda *args, **kwargs: None
+    return prometheus_client
+
+
+@pytest.fixture
+def database_writer_cls(monkeypatch):
+    """Import DatabaseWriter with a test-local prometheus stub when needed."""
+    monkeypatch.delitem(sys.modules, "services.db_writer.db_writer", raising=False)
+
+    try:
+        importlib.import_module("prometheus_client")
+    except ModuleNotFoundError:
+        monkeypatch.setitem(
+            sys.modules,
+            "prometheus_client",
+            _build_prometheus_client_stub(),
+        )
+
+    module = importlib.import_module("services.db_writer.db_writer")
+    return module.DatabaseWriter
 
 
 @pytest.mark.unit
@@ -81,9 +120,9 @@ def test_event_persistence(mock_postgres, signal_factory):
 
 
 @pytest.mark.unit
-def test_process_trade_event_decodes_metadata_json_string():
+def test_process_trade_event_decodes_metadata_json_string(database_writer_cls):
     """Trade metadata arriving as JSON string must be persisted as JSON object."""
-    writer = DatabaseWriter()
+    writer = database_writer_cls()
     writer.db_conn = MagicMock()
     cursor = writer.db_conn.cursor.return_value
     cursor.fetchone.return_value = [1]
