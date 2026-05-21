@@ -420,14 +420,15 @@ context-smoke-db: context-env-check
 	@echo "--- Schritt 2: Scan (Snapshot + JSONL erzeugen) ---"
 	$(MAKE) context-scan CONTEXT_SCOPE_CONFIG=infrastructure/config/surrealdb/context_ingestion_scope.smoke.yaml
 	@echo "--- Schritt 3: Import (echter SurrealDB-Adapter, fail-closed) ---"
-	@$(PYTHON) -m tools.surrealdb.context_importer apply \
+	@RUN_ID=$$($(PYTHON) tools/surrealdb/gen_run_id.py $(CONTEXT_SNAP_DIR)/snapshot.json) && \
+	$(PYTHON) -m tools.surrealdb.context_importer apply \
 		--input-dir $(CONTEXT_SNAP_DIR) \
 		--surreal-url http://127.0.0.1:8010 \
 		--namespace cdb_context_local \
 		--database cdb_context_intel \
 		--apply --apply-mode local-dev \
 		--config infrastructure/config/surrealdb/context_import.local.example.yaml \
-		--run-id $(shell $(PYTHON) tools/surrealdb/gen_run_id.py $(CONTEXT_SNAP_DIR)/snapshot.json) \
+		--run-id $$RUN_ID \
 		--adapter surrealdb-local \
 		--secrets-path "$(SECRETS_PATH)"
 	@echo "--- Schritt 4: Query-Smoke (hard, >= 1 Record, fail-closed) ---"
