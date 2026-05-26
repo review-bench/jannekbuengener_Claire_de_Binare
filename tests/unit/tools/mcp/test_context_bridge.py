@@ -4,6 +4,8 @@ Unit tests for Context MCP Bridge Scaffold.
 Tests the scaffold structure without requiring live SurrealDB or network.
 """
 
+from pathlib import Path
+from typing import Any
 import pytest
 from tools.mcp.context_bridge import ContextBridge, create_bridge
 from tools.mcp.registry import ContextToolRegistry
@@ -111,7 +113,7 @@ class TestContextTraceHandler:
         assert result["error"]["code"] == "target_not_found"
 
     def test_valid_target_id_returns_ok(self) -> None:
-        """Valid target_id returns ok status with trace (mocked)."""
+        """Valid target_id returns ok status with trace payload."""
         bridge = create_bridge()
         result = bridge.execute_tool("context.trace", {"target_id": "evt_abc123"})
         assert result["status"] == "ok"
@@ -119,15 +121,16 @@ class TestContextTraceHandler:
         assert "trace" in result
         assert "root" in result["trace"]
         assert "lineage" in result["trace"]
+        assert result["trace"]["lineage"] == []
 
     def test_depth_parameter_accepted(self) -> None:
-        """Depth parameter is accepted and respected."""
+        """Depth parameter is accepted without inventing lineage."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.trace", {"target_id": "evt_abc123", "depth": 10}
         )
         assert result["status"] == "ok"
-        assert len(result["trace"]["lineage"]) <= 10
+        assert result["trace"]["lineage"] == []
 
     def test_depth_exceeds_max_returns_error(self) -> None:
         """Depth exceeding 20 returns error."""
@@ -144,6 +147,13 @@ class TestContextTraceHandler:
         result = bridge.execute_tool("context.trace", {"target_id": "evt_test"})
         assert result["status"] == "ok"
         assert result["trace"]["root"]["id"] == "evt_test"
+
+    def test_trace_root_title_is_neutral(self) -> None:
+        """Trace root title must not claim mock provenance."""
+        bridge = create_bridge()
+        result = bridge.execute_tool("context.trace", {"target_id": "evt_test"})
+        assert result["status"] == "ok"
+        assert result["trace"]["root"]["title"] == "Trace target: evt_test"
 
 
 class TestContextExplainSourceHandler:
@@ -164,21 +174,22 @@ class TestContextExplainSourceHandler:
         assert result["error"]["code"] == "invalid_source_ref"
 
     def test_valid_source_ref_returns_ok(self) -> None:
-        """Valid source_ref returns ok status with explanation (mocked)."""
+        """Registered tool name resolves to repo-/registry-only explanation."""
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_abc123"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         assert result["status"] == "ok"
         assert result["tool"] == "context.explain_source"
         assert "explanation" in result
-        assert result["explanation"]["source_ref"] == "src_abc123"
+        assert result["explanation"]["source_ref"] == "context.readiness"
+        assert result["explanation"]["source_type"] == "tool"
 
     def test_include_chain_default_true(self) -> None:
         """include_chain defaults to True."""
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_abc123"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         assert result["status"] == "ok"
         assert result["metadata"]["include_chain"] is True
@@ -189,7 +200,7 @@ class TestContextExplainSourceHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.explain_source",
-            {"source_ref": "src_abc123", "include_chain": False},
+            {"source_ref": "context.readiness", "include_chain": False},
         )
         assert result["status"] == "ok"
         assert result["metadata"]["include_chain"] is False
@@ -199,7 +210,7 @@ class TestContextExplainSourceHandler:
         """Explanation has all required fields per #2096."""
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_abc123"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         assert result["status"] == "ok"
         expl = result["explanation"]
@@ -211,6 +222,150 @@ class TestContextExplainSourceHandler:
         assert "warnings" in expl
         assert "stale" in expl
         assert "tombstone" in expl
+
+    def test_tool_prefix_resolves_registered_tool(self) -> None:
+        """tool:<name> resolves exactly like the bare registered tool name."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source", {"source_ref": "tool:context.readiness"}
+        )
+        assert result["status"] == "ok"
+        assert result["explanation"]["source_ref"] == "tool:context.readiness"
+        assert result["explanation"]["source_type"] == "tool"
+
+    def test_repo_relative_path_returns_ok(self) -> None:
+        """Repo-relative paths resolve as file sources."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": "docs/runbooks/surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "ok"
+        assert result["explanation"]["source_type"] == "file"
+        assert (
+            result["explanation"]["provenance"]["repo_relative_path"]
+            == "docs/runbooks/surrealdb_context_mcp_access.md"
+        )
+        assert result["explanation"]["provenance"]["exists"] is True
+        assert result["explanation"]["provenance"]["resolver"] == "repo"
+
+    def test_path_prefix_resolves_repo_relative_file(self) -> None:
+        """path:<path> only resolves repo files."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": "path:docs/runbooks/surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "ok"
+        assert result["explanation"]["source_type"] == "file"
+
+    def test_backslash_path_normalizes_to_forward_slashes(self) -> None:
+        """Backslash separators normalize deterministically."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": r"path:docs\runbooks\surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "ok"
+        assert (
+            result["explanation"]["provenance"]["repo_relative_path"]
+            == "docs/runbooks/surrealdb_context_mcp_access.md"
+        )
+
+    def test_tool_prefix_does_not_fallback_to_path_resolution(self) -> None:
+        """tool: only checks the registry."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": "tool:docs/runbooks/surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "source_not_found"
+
+    def test_path_prefix_does_not_fallback_to_tool_resolution(self) -> None:
+        """path: only checks repo-relative files."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source", {"source_ref": "path:context.readiness"}
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "source_not_found"
+
+    def test_unknown_source_ref_returns_source_not_found(self) -> None:
+        """Unknown non-empty refs fail closed with source_not_found."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source", {"source_ref": "context.__does_not_exist__"}
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "source_not_found"
+
+    def test_absolute_path_is_rejected(self) -> None:
+        """Absolute paths are rejected instead of being resolved."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": r"C:\tmp\surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "invalid_source_ref"
+
+    def test_unc_path_is_rejected(self) -> None:
+        """UNC paths are rejected instead of being resolved."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": r"\\server\share\surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "invalid_source_ref"
+
+    def test_parent_traversal_is_rejected(self) -> None:
+        """Parent traversal is rejected instead of being resolved."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": "../docs/runbooks/surrealdb_context_mcp_access.md"},
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "invalid_source_ref"
+
+    def test_tool_provenance_uses_registry_truth(self) -> None:
+        """Tool provenance reports registry fields without dispatching the tool."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source", {"source_ref": "context.readiness"}
+        )
+        provenance = result["explanation"]["provenance"]
+        assert provenance["tool_name"] == "context.readiness"
+        assert provenance["read_only"] is True
+        assert provenance["handler_status"] == "implemented"
+        assert isinstance(provenance["input_schema_keys"], list)
+        assert isinstance(provenance["output_schema_keys"], list)
+
+    def test_include_chain_true_only_contains_internal_resolver_steps(self) -> None:
+        """Resolver chain stays internal and deterministic."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source", {"source_ref": "context.readiness"}
+        )
+        chain = result["explanation"]["provenance"]["chain"]
+        assert [step["step"] for step in chain] == [
+            "input_normalized",
+            "registry_checked",
+            "resolved",
+        ]
+
+    def test_file_output_uses_repo_relative_paths_only(self) -> None:
+        """File output never leaks absolute local paths."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": "docs/runbooks/surrealdb_context_mcp_access.md"},
+        )
+        rendered = str(result["explanation"])
+        assert str(Path.cwd()) not in rendered
+        assert Path.cwd().as_posix() not in rendered
 
 
 class TestContextBridge:
@@ -264,12 +419,14 @@ class TestContextBridge:
         assert schema["name"] == "context.search"
         assert schema["readOnly"] is True
 
-    def test_execute_not_implemented_tool(self) -> None:
-        """Verify executing stub tool returns not_implemented error."""
+    def test_execute_show_audit_tool(self) -> None:
+        """Verify executing context.show_audit returns deterministic audit output."""
         bridge = ContextBridge()
-        result = bridge.execute_tool("context.show_snapshot", {"snapshot_id": "test"})
-        assert result["status"] == "error"
-        assert result["error"]["code"] == "not_implemented"
+        result = bridge.execute_tool(
+            "context.show_audit", {"target_tool": "context.show_audit"}
+        )
+        assert result["status"] == "ok"
+        assert result["audit"]["handler_status"] == "implemented"
 
     def test_execute_unknown_tool(self) -> None:
         """Verify executing unknown tool returns error."""
@@ -882,8 +1039,7 @@ class TestContextReadinessHandler:
         )
         assert result["readiness"]["status"] == "blocked_missing_context"
         assert any(
-            "no stop conditions" in m
-            for m in result["readiness"]["missing_context"]
+            "no stop conditions" in m for m in result["readiness"]["missing_context"]
         )
 
     # --- Blocked: missing_evidence ---
@@ -1100,10 +1256,16 @@ class TestContextReadinessHandler:
         )
         r = result["readiness"]
         expected_fields = [
-            "status", "reasons", "required_next_reads",
-            "human_go_required", "stop_conditions",
-            "missing_context", "missing_evidence",
-            "scope_drift_findings", "uncertainties", "guardrails",
+            "status",
+            "reasons",
+            "required_next_reads",
+            "human_go_required",
+            "stop_conditions",
+            "missing_context",
+            "missing_evidence",
+            "scope_drift_findings",
+            "uncertainties",
+            "guardrails",
         ]
         for field in expected_fields:
             assert field in r, f"Missing output field: {field}"
@@ -1275,6 +1437,593 @@ class TestContextBriefingHandler:
         b = result["briefing"]
         assert b["briefing_id"] != ""
         assert len(b["briefing_id"]) == 16
+
+    def test_briefing_contains_session_context(self) -> None:
+        """Successful response includes briefing.session_context."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-session-context",
+                "task_scope": "Add structured session context.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        assert result["status"] == "ok"
+        assert "session_context" in result["briefing"]
+
+    def test_session_context_core_working_memory_fields(self) -> None:
+        """session_context exposes stable working-memory defaults."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-working-memory",
+                "task_scope": "Validate session context defaults.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["memory_type"] == "working_memory"
+        assert session_context["session_only"] is True
+        assert session_context["ttl_seconds"] <= 14400
+
+    def test_missing_repo_and_github_state_degrade_without_fabrication(self) -> None:
+        """Missing optional repo/github state degrades to unknown or empty values."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-missing-session-state",
+                "task_scope": "Validate missing session state handling.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["repo_state"] == {
+            "branch": "unknown",
+            "commit": "unknown",
+            "working_tree": "unknown",
+        }
+        assert session_context["github_state"]["target_issue"] is None
+        assert session_context["github_state"]["related_prs"] == []
+        assert session_context["github_state"]["open_epics"] == []
+
+    def test_default_brain_context_is_repo_only(self) -> None:
+        """Without DB or inline records, briefing stays repo-only and non-DB-backed."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-default-brain-context",
+                "task_scope": "Validate repo-only derived brain context.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["brain_source"] == "repo-only"
+        assert session_context["brain_status"] == "not-used"
+        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
+
+    def test_repo_only_session_context_matches_brain_evidence_gate_defaults(
+        self,
+    ) -> None:
+        """repo-only session handoff stays non-DB-backed and explicitly not-used."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-brain-evidence-defaults",
+                "task_scope": "Validate Brain Evidence Gate compatibility.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["brain_status"] == "not-used"
+        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
+        assert any(
+            "no DB-backed memory or evidence claims" in item
+            for item in session_context["limitations"]
+        )
+
+    def test_inline_records_derive_in_memory_brain_source(self) -> None:
+        """Inline enrichment records derive in-memory brain context without DB claims."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-inline-in-memory",
+                "task_scope": "Validate in-memory derived Brain Evidence compatibility.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "memory_records": [
+                    {"memory_id": "mem-001", "scope": "wave14", "content": "test"}
+                ],
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["brain_source"] == "in_memory"
+        assert session_context["brain_status"] == "used"
+        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
+
+    def test_db_requested_briefing_uses_surrealdb_local_metadata(
+        self, monkeypatch
+    ) -> None:
+        """DB-backed briefing claims require real adapter metadata, not caller input."""
+        monkeypatch.setattr(
+            "tools.mcp.context_evidence_memory_tools.handle_cdb_context_trust_summary",
+            lambda request: {
+                "tool": "cdb_context_trust_summary",
+                "status": "ok",
+                "result": {"scope": request["parameters"]["scope"]},
+                "metadata": {
+                    "query_time_ms": 0,
+                    "source": "surrealdb-local",
+                    "read_only": True,
+                },
+            },
+        )
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-surrealdb-derived",
+                "task_scope": "Validate surrealdb-local derived claim mode.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "adapter_config_path": "infrastructure/config/surrealdb/context_query.local.example.yaml",
+                "secrets_path": "D:/tmp/fake-secrets",
+            },
+        )
+        assert result["status"] == "ok"
+        session_context = result["briefing"]["session_context"]
+        assert session_context["brain_source"] == "surrealdb-local"
+        assert session_context["brain_status"] == "used"
+        assert session_context["agent_operating_mode"]["db_claims_allowed"] is True
+
+    def test_db_requested_briefing_propagates_adapter_config_error(
+        self, monkeypatch
+    ) -> None:
+        """Config/auth failures on the DB-backed path fail closed on briefing."""
+        monkeypatch.setattr(
+            "tools.mcp.context_evidence_memory_tools.handle_cdb_context_trust_summary",
+            lambda request: {
+                "tool": "cdb_context_trust_summary",
+                "status": "error",
+                "error": {
+                    "code": "adapter_config_error",
+                    "message": "SURREALDB_ENV not found",
+                },
+                "metadata": {
+                    "query_time_ms": 0,
+                    "source": "in_memory",
+                    "read_only": True,
+                },
+            },
+        )
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-db-config-error",
+                "task_scope": "Validate fail-closed DB config handling.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "adapter_config_path": "infrastructure/config/surrealdb/context_query.local.example.yaml",
+            },
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "adapter_config_error"
+
+    def test_db_requested_briefing_fails_closed_on_unavailable_source(
+        self, monkeypatch
+    ) -> None:
+        """Soft-unavailable DB status still fails closed on briefing."""
+        monkeypatch.setattr(
+            "tools.mcp.context_evidence_memory_tools.handle_cdb_context_trust_summary",
+            lambda request: {
+                "tool": "cdb_context_trust_summary",
+                "status": "ok",
+                "result": {"scope": request["parameters"]["scope"]},
+                "metadata": {
+                    "query_time_ms": 0,
+                    "source": "surrealdb-local-unavailable",
+                    "read_only": True,
+                },
+            },
+        )
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-db-unavailable",
+                "task_scope": "Validate unavailable surrealdb claim mode.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "adapter_config_path": "infrastructure/config/surrealdb/context_query.local.example.yaml",
+            },
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "adapter_unavailable"
+
+    def test_caller_brain_source_is_ignored_without_db(self) -> None:
+        """Caller-supplied surrealdb-local claims cannot fake DB readiness."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-ignore-caller-brain-source",
+                "task_scope": "Validate caller claim suppression.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "brain_source": "surrealdb-local",
+                "brain_status": "used",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["brain_source"] == "repo-only"
+        assert session_context["brain_status"] == "not-used"
+        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
+        assert any(
+            "caller input ignored" in item for item in session_context["limitations"]
+        )
+
+    def test_repo_state_values_are_preserved_when_provided(self) -> None:
+        """Caller-provided repo_state values are preserved."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-repo-state-preserve",
+                "task_scope": "Validate repo_state preservation.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "repo_state": {
+                    "branch": "feature/session-context",
+                    "commit": "abc123def456",
+                    "working_tree": "dirty",
+                },
+            },
+        )
+        assert result["briefing"]["session_context"]["repo_state"] == {
+            "branch": "feature/session-context",
+            "commit": "abc123def456",
+            "working_tree": "dirty",
+        }
+
+    def test_github_state_values_are_preserved_when_provided(self) -> None:
+        """Caller-provided github_state values are preserved."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-github-state-preserve",
+                "task_scope": "Validate github_state preservation.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "github_state": {
+                    "target_issue": "#2607",
+                    "related_prs": ["#2613", "#2614"],
+                    "open_epics": ["#2607"],
+                },
+            },
+        )
+        assert result["briefing"]["session_context"]["github_state"] == {
+            "target_issue": "#2607",
+            "related_prs": ["#2613", "#2614"],
+            "open_epics": ["#2607"],
+        }
+
+    def test_repo_state_branch_changes_briefing_id(self) -> None:
+        """Different normalized repo_state.branch values change briefing_id."""
+        bridge = create_bridge()
+        base = {
+            "task_id": "cdb-briefing-hash-repo-branch",
+            "task_scope": "Validate briefing_id repo_state sensitivity.",
+            "target_issue": "#2607",
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+            "repo_state": {
+                "commit": "abc123",
+                "working_tree": "clean",
+            },
+        }
+        r1 = bridge.execute_tool(
+            "context.briefing",
+            {**base, "repo_state": {**base["repo_state"], "branch": "branch-a"}},
+        )
+        r2 = bridge.execute_tool(
+            "context.briefing",
+            {**base, "repo_state": {**base["repo_state"], "branch": "branch-b"}},
+        )
+        assert r1["briefing"]["briefing_id"] != r2["briefing"]["briefing_id"]
+
+    def test_github_state_changes_briefing_id(self) -> None:
+        """Different normalized github_state values change briefing_id."""
+        bridge = create_bridge()
+        base = {
+            "task_id": "cdb-briefing-hash-github-state",
+            "task_scope": "Validate briefing_id github_state sensitivity.",
+            "target_issue": None,
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+        }
+        r1 = bridge.execute_tool(
+            "context.briefing",
+            {
+                **base,
+                "github_state": {
+                    "target_issue": "#2607",
+                    "related_prs": ["#2618"],
+                    "open_epics": [],
+                },
+            },
+        )
+        r2 = bridge.execute_tool(
+            "context.briefing",
+            {
+                **base,
+                "github_state": {
+                    "target_issue": "#2607",
+                    "related_prs": ["#9999"],
+                    "open_epics": [],
+                },
+            },
+        )
+        assert r1["briefing"]["briefing_id"] != r2["briefing"]["briefing_id"]
+
+    def test_derived_brain_context_changes_briefing_id(self) -> None:
+        """Different derived brain contexts change briefing_id."""
+        bridge = create_bridge()
+        base = {
+            "task_id": "cdb-briefing-hash-brain-source",
+            "task_scope": "Validate briefing_id brain_source sensitivity.",
+            "target_issue": None,
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+        }
+        r1 = bridge.execute_tool("context.briefing", base)
+        r2 = bridge.execute_tool(
+            "context.briefing",
+            {
+                **base,
+                "memory_records": [
+                    {"memory_id": "mem-001", "scope": "wave14", "content": "test"}
+                ],
+            },
+        )
+        assert r1["briefing"]["briefing_id"] != r2["briefing"]["briefing_id"]
+
+    def test_working_assumptions_change_briefing_id(self) -> None:
+        """Different working_assumptions values change briefing_id."""
+        bridge = create_bridge()
+        base = {
+            "task_id": "cdb-briefing-hash-assumptions",
+            "task_scope": "Validate briefing_id assumptions sensitivity.",
+            "target_issue": None,
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+        }
+        r1 = bridge.execute_tool(
+            "context.briefing", {**base, "working_assumptions": ["assumption-a"]}
+        )
+        r2 = bridge.execute_tool(
+            "context.briefing", {**base, "working_assumptions": ["assumption-b"]}
+        )
+        assert r1["briefing"]["briefing_id"] != r2["briefing"]["briefing_id"]
+
+    def test_malformed_session_context_inputs_are_normalized_before_hashing(
+        self,
+    ) -> None:
+        """Malformed session-context inputs hash by normalized, deterministic values."""
+        bridge = create_bridge()
+        base = {
+            "task_id": "cdb-briefing-hash-malformed-session-context",
+            "task_scope": "Validate normalized hashing for malformed session inputs.",
+            "target_issue": None,
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+        }
+        malformed_inputs = {
+            "brain_source": object(),
+            "brain_status": 1,
+            "repo_state": "bad",
+            "github_state": "bad",
+            "working_assumptions": "bad",
+            "limitations": "bad",
+        }
+        r1 = bridge.execute_tool("context.briefing", {**base, **malformed_inputs})
+        r2 = bridge.execute_tool("context.briefing", {**base, **malformed_inputs})
+        assert r1["briefing"]["briefing_id"] == r2["briefing"]["briefing_id"]
+
+    def test_identical_normalized_session_context_inputs_keep_same_briefing_id(
+        self,
+    ) -> None:
+        """Equivalent normalized inputs produce identical briefing_id."""
+        bridge = create_bridge()
+        inputs_a = {
+            "task_id": "cdb-briefing-hash-normalized-equality",
+            "task_scope": "Validate normalized session hashing equality.",
+            "target_issue": None,
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+            "repo_state": {
+                "branch": " feature/session-context ",
+                "commit": " abc123 ",
+                "working_tree": "dirty",
+            },
+            "github_state": {
+                "target_issue": None,
+                "related_prs": ["#2618"],
+                "open_epics": ["#2607"],
+            },
+            "working_assumptions": ["assumption"],
+            "limitations": ["limit", "limit"],
+        }
+        inputs_b = {
+            "task_id": "cdb-briefing-hash-normalized-equality",
+            "task_scope": "Validate normalized session hashing equality.",
+            "target_issue": None,
+            "requested_depth": "quick",
+            "operation_mode": "read_only",
+            "repo_state": {
+                "branch": "feature/session-context",
+                "commit": "abc123",
+                "working_tree": "dirty",
+            },
+            "github_state": {
+                "target_issue": None,
+                "related_prs": ["#2618"],
+                "open_epics": ["#2607"],
+            },
+            "working_assumptions": ["assumption"],
+            "limitations": ["limit"],
+        }
+        r1 = bridge.execute_tool("context.briefing", inputs_a)
+        r2 = bridge.execute_tool("context.briefing", inputs_b)
+        assert r1["briefing"]["briefing_id"] == r2["briefing"]["briefing_id"]
+
+    def test_malformed_working_assumptions_degrade_to_empty_with_limitation(
+        self,
+    ) -> None:
+        """Malformed working_assumptions fail closed to an empty list."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-bad-assumptions",
+                "task_scope": "Validate working_assumptions degradation.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "working_assumptions": "not-a-list",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["working_assumptions"] == []
+        assert any(
+            "working_assumptions malformed" in item
+            for item in session_context["limitations"]
+        )
+
+    def test_malformed_limitations_degrade_safely(self) -> None:
+        """Malformed limitations fail closed to generated limitations only."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-bad-limitations",
+                "task_scope": "Validate limitations degradation.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "limitations": "not-a-list",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert any(
+            "limitations malformed" in item for item in session_context["limitations"]
+        )
+        assert all(isinstance(item, str) for item in session_context["limitations"])
+
+    def test_session_context_can_populate_brain_evidence_fields(self) -> None:
+        """session_context plus sibling briefing fields can fill all Brain Evidence keys."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-brain-evidence-complete",
+                "task_scope": "Validate Brain Evidence handoff completeness.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "repo_state": {
+                    "branch": "fix/2613-noise-freeze-remaining-push-triggers",
+                    "commit": "f345cf0c",
+                    "working_tree": "dirty",
+                },
+                "github_state": {
+                    "target_issue": "#2607",
+                    "related_prs": ["#2613"],
+                    "open_epics": ["#2607"],
+                },
+                "working_assumptions": [
+                    "Use briefing session context before planning."
+                ],
+            },
+        )
+        briefing = result["briefing"]
+        session_context = briefing["session_context"]
+
+        brain_evidence = {
+            "brain_source": session_context["brain_source"],
+            "brain_status": session_context["brain_status"],
+            "tools_or_queries": session_context["working_assumptions"]
+            or session_context["limitations"],
+            "records_or_results": [
+                session_context["repo_state"]["branch"],
+                session_context["repo_state"]["commit"],
+                str(session_context["github_state"]["target_issue"]),
+                *session_context["github_state"]["related_prs"],
+                *session_context["github_state"]["open_epics"],
+            ],
+            "repo_crosscheck": [
+                session_context["repo_state"]["branch"],
+                session_context["repo_state"]["commit"],
+                *briefing["required_reads"],
+            ],
+            "impact_on_plan": [
+                *session_context["working_assumptions"],
+                *session_context["limitations"],
+            ],
+            "limitations": session_context["limitations"],
+        }
+
+        assert brain_evidence["brain_source"] == "repo-only"
+        assert brain_evidence["brain_status"] == "not-used"
+        for key in (
+            "tools_or_queries",
+            "records_or_results",
+            "repo_crosscheck",
+            "impact_on_plan",
+            "limitations",
+        ):
+            assert isinstance(brain_evidence[key], list)
+            assert brain_evidence[key]
+
+    def test_session_context_read_only_mode_sets_human_go_false(self) -> None:
+        """read_only operation mode stays non-human-gated in session_context."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-read-only-mode",
+                "task_scope": "Validate read-only session mode.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        session_context = result["briefing"]["session_context"]
+        assert session_context["agent_operating_mode"]["operation_mode"] == "read_only"
+        assert session_context["agent_operating_mode"]["human_go_required"] is False
 
     def test_output_contains_all_16_contract_fields(self) -> None:
         """Output contains all 16 briefing contract fields per #2104 schema."""
@@ -1465,8 +2214,7 @@ class TestContextBriefingHandler:
         stop_conditions = b["stop_conditions"]
         all_text = " ".join(stop_conditions + b["unresolved_questions"])
         assert (
-            "blocked" in all_text.lower()
-            or "scope" in all_text.lower()
+            "blocked" in all_text.lower() or "scope" in all_text.lower()
         ), "Readiness blocker should be reflected in output"
 
     def test_known_risks_contains_mock_note(self) -> None:
@@ -1485,8 +2233,7 @@ class TestContextBriefingHandler:
         assert result["status"] == "ok"
         b = result["briefing"]
         assert any(
-            "synthetic" in r.lower() or "mock" in r.lower()
-            for r in b["known_risks"]
+            "synthetic" in r.lower() or "mock" in r.lower() for r in b["known_risks"]
         ), "Known risks must surface v0 mock note"
 
     def test_validation_plan_present_for_all_modes(self) -> None:
@@ -1509,8 +2256,8 @@ class TestContextBriefingHandler:
             assert "step" in step
             assert "method" in step
 
-    def test_missing_target_issue_returns_error(self) -> None:
-        """Missing target_issue key fails closed."""
+    def test_missing_target_issue_defaults_to_none(self) -> None:
+        """Missing target_issue key now defaults to null/None."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
@@ -1521,8 +2268,11 @@ class TestContextBriefingHandler:
                 "operation_mode": "read_only",
             },
         )
-        assert result["status"] == "error"
-        assert result["error"]["code"] == "invalid_target_issue"
+        assert result["status"] == "ok"
+        assert (
+            result["briefing"]["session_context"]["github_state"]["target_issue"]
+            is None
+        )
 
     def test_target_issue_null_is_ok(self) -> None:
         """target_issue: null (None) is explicitly allowed."""
@@ -1539,8 +2289,8 @@ class TestContextBriefingHandler:
         )
         assert result["status"] == "ok"
 
-    def test_missing_requested_depth_returns_error(self) -> None:
-        """Missing requested_depth key fails closed."""
+    def test_missing_requested_depth_defaults_to_quick(self) -> None:
+        """Missing requested_depth now defaults to quick."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
@@ -1551,8 +2301,21 @@ class TestContextBriefingHandler:
                 "operation_mode": "read_only",
             },
         )
-        assert result["status"] == "error"
-        assert result["error"]["code"] == "invalid_depth"
+        explicit_quick = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-test",
+                "task_scope": "Test scope.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        assert result["status"] == "ok"
+        assert (
+            result["briefing"]["briefing_id"]
+            == explicit_quick["briefing"]["briefing_id"]
+        )
 
     def test_missing_operation_mode_returns_error(self) -> None:
         """Missing operation_mode key fails closed."""
@@ -1587,7 +2350,13 @@ class TestContextBriefingHandler:
         assert b["human_go_required"] is False
         assert len(b["required_reads"]) >= 6
         # Must not contain blocked scope or artificial missing reads
-        assert "blocked" not in b["scope_summary"].lower().split("readiness status: ")[-1].split(".")[0]
+        assert (
+            "blocked"
+            not in b["scope_summary"]
+            .lower()
+            .split("readiness status: ")[-1]
+            .split(".")[0]
+        )
 
     def test_different_target_paths_produce_different_briefing_id(self) -> None:
         """Different target_paths produce different briefing_id."""
@@ -1653,7 +2422,9 @@ class TestCdbContextBriefingAlias:
             assert "guardrails" in briefing
             assert "human_go_required" in briefing
 
-    def test_alias_preserves_stop_conditions_guardrails_human_go_visibility(self) -> None:
+    def test_alias_preserves_stop_conditions_guardrails_human_go_visibility(
+        self,
+    ) -> None:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "cdb_context_briefing",
@@ -1718,9 +2489,7 @@ class TestContextStopResolverHandler:
     def test_empty_stop_conditions_returns_empty(self) -> None:
         """Empty stop_conditions returns empty resolved list."""
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.stop_resolver", {"stop_conditions": []}
-        )
+        result = bridge.execute_tool("context.stop_resolver", {"stop_conditions": []})
         assert result["status"] == "ok"
         assert result["resolved"] == []
 
@@ -1976,13 +2745,25 @@ class TestContextStopResolverHandler:
         )
         assert result["status"] == "ok"
         r = result["resolved"][0]
-        for field in ("type", "severity", "reason", "required_action", "human_go_required"):
+        for field in (
+            "type",
+            "severity",
+            "reason",
+            "required_action",
+            "human_go_required",
+        ):
             assert field in r, f"Missing field: {field}"
         assert r["type"] in {
-            "missing_context", "missing_evidence", "scope_drift_risk",
-            "runtime_surface_touched", "trading_surface_touched",
-            "write_requires_human_go", "stale_context",
-            "contradiction_risk", "forbidden_path", "secrets_risk",
+            "missing_context",
+            "missing_evidence",
+            "scope_drift_risk",
+            "runtime_surface_touched",
+            "trading_surface_touched",
+            "write_requires_human_go",
+            "stale_context",
+            "contradiction_risk",
+            "forbidden_path",
+            "secrets_risk",
         }
         assert r["severity"] in {"info", "warning", "blocking"}
         assert isinstance(r["human_go_required"], bool)
@@ -2080,9 +2861,9 @@ class TestContextStopResolverHandler:
         assert "stop_conditions" in b
         assert isinstance(b["stop_conditions"], list)
         for sc in b["stop_conditions"]:
-            assert isinstance(sc, str), (
-                f"stop_conditions must remain string[], got {type(sc).__name__}: {sc!r}"
-            )
+            assert isinstance(
+                sc, str
+            ), f"stop_conditions must remain string[], got {type(sc).__name__}: {sc!r}"
 
     def test_resolver_does_not_mutate_input_list(self) -> None:
         """Input stop_conditions list is not mutated by resolve_stop_conditions."""
@@ -2091,9 +2872,7 @@ class TestContextStopResolverHandler:
         original = ["S1: scope ambiguous", "S4: no evidence"]
         before = list(original)
         resolve_stop_conditions(stop_conditions=original)
-        assert original == before, (
-            f"Input list was mutated: {before} -> {original}"
-        )
+        assert original == before, f"Input list was mutated: {before} -> {original}"
 
     def test_briefing_surfaces_resolver_failure(self) -> None:
         """When the resolver raises, briefing surfaces it in known_risks
@@ -2119,17 +2898,17 @@ class TestContextStopResolverHandler:
         b = result["briefing"]
         assert isinstance(b["stop_conditions"], list)
         for sc in b["stop_conditions"]:
-            assert isinstance(sc, str), (
-                f"stop_conditions must remain string[] on failure"
-            )
+            assert isinstance(
+                sc, str
+            ), f"stop_conditions must remain string[] on failure"
         risk_text = " ".join(b["known_risks"]).lower()
-        assert "resolver unavailable" in risk_text, (
-            f"known_risks should surface resolver failure, got: {b['known_risks']}"
-        )
+        assert (
+            "resolver unavailable" in risk_text
+        ), f"known_risks should surface resolver failure, got: {b['known_risks']}"
         unresolved_text = " ".join(b["unresolved_questions"]).lower()
-        assert "stop condition resolver failed" in unresolved_text, (
-            f"unresolved_questions should surface resolver failure, got: {b['unresolved_questions']}"
-        )
+        assert (
+            "stop condition resolver failed" in unresolved_text
+        ), f"unresolved_questions should surface resolver failure, got: {b['unresolved_questions']}"
 
     def test_live_substring_no_false_positive_deliverable(self) -> None:
         """'deliverable' does NOT trigger forbidden_path (word-boundary fix)."""
@@ -2140,9 +2919,9 @@ class TestContextStopResolverHandler:
         )
         assert result["status"] == "ok"
         r = result["resolved"][0]
-        assert r["type"] != "forbidden_path", (
-            f"deliverable should not trigger forbidden_path, got {r['type']}"
-        )
+        assert (
+            r["type"] != "forbidden_path"
+        ), f"deliverable should not trigger forbidden_path, got {r['type']}"
 
     def test_key_substring_no_false_positive_monkeypatch(self) -> None:
         """'monkeypatch' etc. does NOT trigger secrets_risk (word-boundary fix)."""
@@ -2151,9 +2930,9 @@ class TestContextStopResolverHandler:
         for text in ("monkeypatch", "keyboard", "key result", "turkey"):
             result = resolve_stop_conditions(stop_conditions=[text])
             for r in result:
-                assert r["type"] != "secrets_risk", (
-                    f"{text!r} should not trigger secrets_risk, got {r['type']}"
-                )
+                assert (
+                    r["type"] != "secrets_risk"
+                ), f"{text!r} should not trigger secrets_risk, got {r['type']}"
 
     def test_standalone_live_still_triggers_forbidden_path(self) -> None:
         """Standalone word 'live' still triggers forbidden_path."""
@@ -2173,9 +2952,9 @@ class TestContextStopResolverHandler:
         for text in ("api_key found", "private key exposed", "secret_key leaked"):
             result = resolve_stop_conditions(stop_conditions=[text])
             assert len(result) >= 1
-            assert result[0]["type"] == "secrets_risk", (
-                f"{text!r} should trigger secrets_risk"
-            )
+            assert (
+                result[0]["type"] == "secrets_risk"
+            ), f"{text!r} should trigger secrets_risk"
 
 
 class TestContextRequiredReadsHandler:
@@ -2215,7 +2994,11 @@ class TestContextRequiredReadsHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.required_reads",
-            {"task_scope": "Test scope.", "target_issue": None, "operation_mode": "read_only"},
+            {
+                "task_scope": "Test scope.",
+                "target_issue": None,
+                "operation_mode": "read_only",
+            },
         )
         assert result["status"] == "ok"
 
@@ -2224,7 +3007,11 @@ class TestContextRequiredReadsHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.required_reads",
-            {"task_scope": "Test scope.", "target_issue": 123, "operation_mode": "read_only"},
+            {
+                "task_scope": "Test scope.",
+                "target_issue": 123,
+                "operation_mode": "read_only",
+            },
         )
         assert result["status"] == "error"
         assert result["error"]["code"] == "invalid_target_issue"
@@ -2260,7 +3047,11 @@ class TestContextRequiredReadsHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.required_reads",
-            {"task_scope": "Test scope.", "target_issue": None, "operation_mode": "read_only"},
+            {
+                "task_scope": "Test scope.",
+                "target_issue": None,
+                "operation_mode": "read_only",
+            },
         )
         assert result["status"] == "ok"
         assert result["tool"] == "context.required_reads"
@@ -2273,7 +3064,11 @@ class TestContextRequiredReadsHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.required_reads",
-            {"task_scope": "Test scope.", "target_issue": None, "operation_mode": "read_only"},
+            {
+                "task_scope": "Test scope.",
+                "target_issue": None,
+                "operation_mode": "read_only",
+            },
         )
         baseline_paths = {
             "AGENTS.md",
@@ -2297,7 +3092,11 @@ class TestContextRequiredReadsHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.required_reads",
-            {"task_scope": "Test scope.", "target_issue": None, "operation_mode": "read_only"},
+            {
+                "task_scope": "Test scope.",
+                "target_issue": None,
+                "operation_mode": "read_only",
+            },
         )
         for read in result["resolved_reads"]:
             if read["path"] == "AGENTS.md":
@@ -2358,9 +3157,9 @@ class TestContextRequiredReadsHandler:
         # Same path under a non-existent root should fail
         fake_root = Path("/nonexistent/repo/root")
         available, warning = _check_availability("AGENTS.md", repo_root=fake_root)
-        assert available is False, (
-            f"AGENTS.md should NOT exist under fake root, got available={available}"
-        )
+        assert (
+            available is False
+        ), f"AGENTS.md should NOT exist under fake root, got available={available}"
         assert warning is not None
 
     # --- Write mode ---
@@ -2379,26 +3178,35 @@ class TestContextRequiredReadsHandler:
         assert result["status"] == "ok"
         paths = {r["path"] for r in result["resolved_reads"]}
         # Write mode should add governance-related reads
-        assert "knowledge/governance/CDB_AGENT_POLICY.md" in paths or len(
-            [r for r in result["resolved_reads"] if r["priority"] == "must_read"]
-        ) > 6, "Write mode should add extra must_read entries"
+        assert (
+            "knowledge/governance/CDB_AGENT_POLICY.md" in paths
+            or len(
+                [r for r in result["resolved_reads"] if r["priority"] == "must_read"]
+            )
+            > 6
+        ), "Write mode should add extra must_read entries"
 
     def test_read_only_mode_does_not_add_write_reads(self) -> None:
         """read_only mode doesn't add write-mode governance reads."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.required_reads",
-            {"task_scope": "Inspect code.", "target_issue": None, "operation_mode": "read_only"},
+            {
+                "task_scope": "Inspect code.",
+                "target_issue": None,
+                "operation_mode": "read_only",
+            },
         )
         # DELIVERY_APPROVED.yaml is only added for write modes
         delivery_entries = [
-            r for r in result["resolved_reads"]
+            r
+            for r in result["resolved_reads"]
             if r["path"] == "knowledge/governance/DELIVERY_APPROVED.yaml"
             and r["priority"] == "must_read"
         ]
-        assert len(delivery_entries) == 0, (
-            "DELIVERY_APPROVED.yaml must_read should not appear in read_only mode"
-        )
+        assert (
+            len(delivery_entries) == 0
+        ), "DELIVERY_APPROVED.yaml must_read should not appear in read_only mode"
 
     # --- Domain scope ---
 
@@ -2416,9 +3224,9 @@ class TestContextRequiredReadsHandler:
         )
         assert result["status"] == "ok"
         paths = {r["path"] for r in result["resolved_reads"]}
-        assert "docs/surrealdb/context-package-model-v1.md" in paths, (
-            "SurrealDB scope should add context package model doc"
-        )
+        assert (
+            "docs/surrealdb/context-package-model-v1.md" in paths
+        ), "SurrealDB scope should add context package model doc"
 
     def test_ci_domain_reads_point_to_files(self) -> None:
         """CI domain reads resolve to concrete files, not directories."""
@@ -2431,13 +3239,13 @@ class TestContextRequiredReadsHandler:
         assert len(ci_reads) > 0, "CI domain must have reads"
         for read in ci_reads:
             path = read["path"]
-            assert not path.endswith("/"), (
-                f"CI read path must be a file, not directory: {path!r}"
-            )
+            assert not path.endswith(
+                "/"
+            ), f"CI read path must be a file, not directory: {path!r}"
             available, warning = _check_availability(path)
-            assert available is True, (
-                f"CI read {path!r} should be available, got warning={warning!r}"
-            )
+            assert (
+                available is True
+            ), f"CI read {path!r} should be available, got warning={warning!r}"
 
     # --- Symbols do not invent file paths ---
 
@@ -2450,18 +3258,21 @@ class TestContextRequiredReadsHandler:
                 "task_scope": "Refactor handler.",
                 "target_issue": None,
                 "operation_mode": "read_only",
-                "target_symbols": ["context_briefing_handler", "resolve_required_reads"],
+                "target_symbols": [
+                    "context_briefing_handler",
+                    "resolve_required_reads",
+                ],
             },
         )
         assert result["status"] == "ok"
         for read in result["resolved_reads"]:
             if read["source_ref"] == "target_symbols":
-                assert read["available"] is False, (
-                    f"Symbol entry should have available=false: {read}"
-                )
-                assert read["warning"] is not None, (
-                    f"Symbol entry should have warning: {read}"
-                )
+                assert (
+                    read["available"] is False
+                ), f"Symbol entry should have available=false: {read}"
+                assert (
+                    read["warning"] is not None
+                ), f"Symbol entry should have warning: {read}"
                 return
         pytest.fail("No target_symbols entry found in resolved reads")
 
@@ -2494,7 +3305,14 @@ class TestContextRequiredReadsHandler:
                 "operation_mode": "read_only",
             },
         )
-        required_fields = {"path", "priority", "reason", "source_ref", "available", "warning"}
+        required_fields = {
+            "path",
+            "priority",
+            "reason",
+            "source_ref",
+            "available",
+            "warning",
+        }
         for read in result["resolved_reads"]:
             for field in required_fields:
                 assert field in read, f"Read missing field {field}: {read}"
@@ -2512,9 +3330,9 @@ class TestContextRequiredReadsHandler:
         )
         valid_priorities = {"must_read", "should_read", "optional"}
         for read in result["resolved_reads"]:
-            assert read["priority"] in valid_priorities, (
-                f"Invalid priority {read['priority']!r} in {read['path']}"
-            )
+            assert (
+                read["priority"] in valid_priorities
+            ), f"Invalid priority {read['priority']!r} in {read['path']}"
 
     # --- Schema compatibility ---
 
@@ -2536,9 +3354,9 @@ class TestContextRequiredReadsHandler:
         assert "required_reads" in b
         assert isinstance(b["required_reads"], list)
         for item in b["required_reads"]:
-            assert isinstance(item, str), (
-                f"required_reads must remain string[], got {type(item).__name__}: {item!r}"
-            )
+            assert isinstance(
+                item, str
+            ), f"required_reads must remain string[], got {type(item).__name__}: {item!r}"
 
     # --- Tool registration ---
 
@@ -2577,9 +3395,9 @@ class TestContextRequiredReadsHandler:
                 "context.required_reads",
                 {"task_scope": "Test.", "target_issue": None, "operation_mode": mode},
             )
-            assert result["status"] == "ok", (
-                f"Valid mode {mode!r} should be accepted, got {result}"
-            )
+            assert (
+                result["status"] == "ok"
+            ), f"Valid mode {mode!r} should be accepted, got {result}"
 
 
 class TestCdbContextImpactHandler:
@@ -2671,7 +3489,10 @@ class TestCdbContextImpactHandler:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "cdb_context_impact",
-            {"target_paths": ["knowledge/governance/CDB_CONSTITUTION.md"], "target_issue": "#2111"},
+            {
+                "target_paths": ["knowledge/governance/CDB_CONSTITUTION.md"],
+                "target_issue": "#2111",
+            },
         )
         assert result["status"] == "ok"
         assert result["impact"]["impact_level"] == "blocking"
@@ -2852,9 +3673,9 @@ class TestWave14BridgeDispatch:
         bridge = create_bridge()
         result = bridge.execute_tool(tool_name, {})
         error_code = result.get("error", {}).get("code")
-        assert error_code != "not_implemented", (
-            f"{tool_name} returned not_implemented — registry stub not replaced"
-        )
+        assert (
+            error_code != "not_implemented"
+        ), f"{tool_name} returned not_implemented — registry stub not replaced"
 
     @pytest.mark.parametrize("tool_name", _WAVE14_TOOLS)
     def test_metadata_read_only_true(self, tool_name: str) -> None:
@@ -2862,9 +3683,9 @@ class TestWave14BridgeDispatch:
         bridge = create_bridge()
         result = bridge.execute_tool(tool_name, {})
         metadata = result.get("metadata", {})
-        assert metadata.get("read_only") is True, (
-            f"{tool_name} missing metadata.read_only=True in result: {result}"
-        )
+        assert (
+            metadata.get("read_only") is True
+        ), f"{tool_name} missing metadata.read_only=True in result: {result}"
 
     def test_evidence_resolve_with_records(self) -> None:
         """evidence_resolve accepts inline records (noop/in-memory path)."""
@@ -2885,11 +3706,7 @@ class TestWave14BridgeDispatch:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "cdb_context_claim_resolve",
-            {
-                "claim_records": [
-                    {"id": "c1", "text": "Test claim", "status": "open"}
-                ]
-            },
+            {"claim_records": [{"id": "c1", "text": "Test claim", "status": "open"}]},
         )
         assert result.get("error", {}).get("code") != "not_implemented"
         assert result.get("metadata", {}).get("read_only") is True
@@ -2954,3 +3771,103 @@ class TestWave14BridgeDispatch:
         assert result["status"] == "error"
         assert result["error"]["code"] == "unknown_tool"
         assert result["error"]["code"] != "not_implemented"
+
+    @staticmethod
+    def _minimal_payload(tool_name: str) -> dict[str, Any]:
+        if tool_name == "cdb_context_evidence_resolve":
+            return {
+                "mode": "by_artifact",
+                "artifact": "tools/surrealdb/evidence_lookup.py",
+                "evidence_records": [
+                    {
+                        "evidence_id": "ev_test_1",
+                        "evidence_type": "test_run",
+                        "confidence": 0.8,
+                        "artifact_refs": ["tools/surrealdb/evidence_lookup.py"],
+                        "claim_refs": [],
+                        "decision_refs": [],
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_claim_resolve":
+            return {
+                "mode": "by_topic",
+                "topic": "context_tools",
+                "claim_records": [
+                    {
+                        "claim_id": "claim_test_1",
+                        "title": "Test claim",
+                        "statement": "read-only claim",
+                        "status": "supported",
+                        "scope": "wave14",
+                        "topic": "context_tools",
+                        "evidence_refs": [],
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_memory_get":
+            return {
+                "mode": "by_scope",
+                "scope": "wave14",
+                "memory_records": [
+                    {
+                        "memory_id": "mem_test_1",
+                        "scope": "wave14",
+                        "memory_type": "constraint",
+                        "content": "read-only memory",
+                        "agent": "bridge-test",
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_trust_summary":
+            return {"scope": "wave14"}
+        if tool_name == "cdb_context_decision_history":
+            return {
+                "mode": "by_topic",
+                "topic": "context_tools",
+                "decision_events": [
+                    {
+                        "decision_id": "dec_test_1",
+                        "title": "Decision",
+                        "topic": "context_tools",
+                        "scope": "wave14",
+                        "status": "approved",
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_decision_replay":
+            return {
+                "mode": "replay_by_scope",
+                "scope": "wave14",
+                "decision_events": [
+                    {
+                        "decision_id": "dec_test_1",
+                        "title": "Decision",
+                        "topic": "context_tools",
+                        "scope": "wave14",
+                        "status": "approved",
+                    }
+                ],
+            }
+        raise AssertionError(f"Unhandled Wave-14 tool: {tool_name}")
+
+    @pytest.mark.parametrize("tool_name", _WAVE14_TOOLS)
+    def test_forged_db_claim_fields_do_not_change_in_memory_source(
+        self, tool_name: str
+    ) -> None:
+        """Bridge-level dispatch must not let caller fields fake DB-backed mode."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            tool_name,
+            {
+                **self._minimal_payload(tool_name),
+                "source": "surrealdb-local",
+                "brain_source": "surrealdb-local",
+                "brain_status": "used",
+                "metadata": {"source": "surrealdb-local"},
+            },
+        )
+
+        assert result.get("error", {}).get("code") != "not_implemented"
+        assert result.get("metadata", {}).get("read_only") is True
+        assert result.get("metadata", {}).get("source") == "in_memory"

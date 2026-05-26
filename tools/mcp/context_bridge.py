@@ -12,7 +12,10 @@ Reference:
 
 import logging
 import json
+import hashlib
 from copy import deepcopy
+from pathlib import Path, PurePosixPath
+import re
 from typing import Any, Optional
 
 from tools.mcp.permission_guard import PermissionGuard
@@ -21,6 +24,134 @@ from tools.mcp.registry import ContextToolRegistry, ToolDefinition
 logger = logging.getLogger(__name__)
 
 CDB_CONTEXT_BRIEFING_MAX_RESPONSE_BYTES = 200_000
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _explain_source_error(code: str, message: str) -> dict[str, Any]:
+    return {
+        "tool": "context.explain_source",
+        "status": "error",
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+
+
+def _normalize_repo_relative_path(path_value: str) -> str | None:
+    normalized = path_value.strip().replace("\\", "/")
+    if not normalized:
+        return None
+    if normalized.startswith("/") or normalized.startswith("//"):
+        return None
+    if re.match(r"^[A-Za-z]:", normalized):
+        return None
+
+    parts: list[str] = []
+    for part in PurePosixPath(normalized).parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+
+    if not parts:
+        return None
+
+    return PurePosixPath(*parts).as_posix()
+
+
+def _repo_relative_file_exists(repo_relative_path: str) -> bool:
+    return (REPO_ROOT / repo_relative_path).is_file()
+
+
+def _infer_handler_status(tool_def: ToolDefinition) -> str:
+    handler = tool_def.handler
+    if handler is None:
+        return "not_implemented"
+
+    handler_name = getattr(handler, "__name__", "")
+    if handler_name == "not_implemented_handler":
+        return "not_implemented"
+
+    return "implemented"
+
+
+def _sorted_source_refs(*entries: dict[str, str]) -> list[dict[str, str]]:
+    refs = [dict(entry) for entry in entries]
+    return sorted(refs, key=lambda item: (item["ref"], item["type"]))
+
+
+def _build_tool_source_explanation(
+    source_ref: str,
+    tool_name: str,
+    include_chain: bool,
+    resolution_chain: list[dict[str, Any]],
+) -> dict[str, Any]:
+    tool_def = ContextToolRegistry.get_tool(tool_name)
+    if tool_def is None:
+        raise KeyError(tool_name)
+
+    source_refs = _sorted_source_refs(
+        {"ref": "resolver:registry", "type": "resolver"},
+        {"ref": f"tool:{tool_name}", "type": "tool"},
+    )
+    provenance: dict[str, Any] = {
+        "tool_name": tool_name,
+        "read_only": bool(tool_def.read_only),
+        "handler_status": _infer_handler_status(tool_def),
+        "input_schema_keys": sorted(
+            list(tool_def.input_schema.get("properties", {}).keys())
+        ),
+        "output_schema_keys": sorted(
+            list(tool_def.output_schema.get("properties", {}).keys())
+        ),
+        "resolver": "registry",
+    }
+    if include_chain:
+        provenance["chain"] = [dict(step) for step in resolution_chain]
+
+    return {
+        "source_ref": source_ref,
+        "source_type": "tool",
+        "provenance": provenance,
+        "source_refs": source_refs,
+        "confidence": 1.0,
+        "warnings": [],
+        "stale": False,
+        "tombstone": False,
+    }
+
+
+def _build_file_source_explanation(
+    source_ref: str,
+    repo_relative_path: str,
+    include_chain: bool,
+    resolution_chain: list[dict[str, Any]],
+) -> dict[str, Any]:
+    source_refs = _sorted_source_refs(
+        {"ref": f"path:{repo_relative_path}", "type": "repo_file"},
+        {"ref": "resolver:repo", "type": "resolver"},
+    )
+    provenance: dict[str, Any] = {
+        "repo_relative_path": repo_relative_path,
+        "source_type": "file",
+        "exists": True,
+        "resolver": "repo",
+    }
+    if include_chain:
+        provenance["chain"] = [dict(step) for step in resolution_chain]
+
+    return {
+        "source_ref": source_ref,
+        "source_type": "file",
+        "provenance": provenance,
+        "source_refs": source_refs,
+        "confidence": 1.0,
+        "warnings": [],
+        "stale": False,
+        "tombstone": False,
+    }
 
 
 def context_search_handler(**kwargs) -> dict[str, Any]:
@@ -125,31 +256,19 @@ def context_trace_handler(**kwargs) -> dict[str, Any]:
             },
         }
 
-    # Mocked trace results (no live DB/network)
-    # In production, this would query the context graph
+    # No evidence-backed lineage is available in the current read-only bridge mode.
     root = {
         "id": target_id,
         "type": "unknown",
-        "title": f"Mock trace target: {target_id}",
+        "title": f"Trace target: {target_id}",
     }
-
-    lineage = []
-    for i in range(min(depth, 3)):  # Mock up to 3 levels
-        lineage.append(
-            {
-                "id": f"mock_related_{i}",
-                "type": "derived",
-                "relationship": "related_to",
-                "depth": i + 1,
-            }
-        )
 
     return {
         "tool": "context.trace",
         "status": "ok",
         "trace": {
             "root": root,
-            "lineage": lineage,
+            "lineage": [],
         },
     }
 
@@ -158,62 +277,364 @@ def context_explain_source_handler(**kwargs) -> dict[str, Any]:
     """
     Read-only handler for context.explain_source tool.
 
-    Explains provenance of a context source/evidence item.
-    Uses mocked responses (no live DB/network).
-    Fails closed on invalid inputs.
+    Explains provenance of a source using repo-/registry-only resolution.
+    Supports:
+    - exact registered tool names or tool:<tool-name>
+    - existing repo-relative file paths or path:<repo-relative-path>
+    No DB, MCP live, memory, or network resolution is performed.
     """
-    # Validate required source_ref
     source_ref = kwargs.get("source_ref")
     if not source_ref or not isinstance(source_ref, str) or not source_ref.strip():
-        return {
-            "tool": "context.explain_source",
-            "status": "error",
-            "error": {
-                "code": "invalid_source_ref",
-                "message": "source_ref is required and must be a non-empty string",
-            },
-        }
+        return _explain_source_error(
+            "invalid_source_ref",
+            "source_ref is required and must be a non-empty string",
+        )
 
-    # Validate include_chain
     include_chain = kwargs.get("include_chain", True)
     if not isinstance(include_chain, bool):
         include_chain = True
 
-    # Mocked explain result (no live DB/network)
-    mocked_explanation = {
-        "source_ref": source_ref,
-        "source_type": "evidence",
-        "provenance": {
-            "source_path": f"/mock/path/{source_ref}",
-            "hash": "mock_hash_123",
-            "commit": "mock_commit_456",
-            "run_id": "mock_run_789",
-            "import_audit_ref": "mock_audit_012",
-            "evidence_refs": ["mock_ev_1", "mock_ev_2"],
-        },
-        "source_refs": [
-            {"ref": "mock_audit_012", "type": "import_audit"},
-            {"ref": "mock_ev_1", "type": "evidence"},
-        ],
-        "confidence": 0.9,
-        "warnings": [],
-        "stale": False,
-        "tombstone": False,
-    }
-
+    source_ref_clean = source_ref.strip()
+    resolution_chain: list[dict[str, Any]] = []
     if include_chain:
-        mocked_explanation["provenance"]["chain"] = [
-            {"level": 1, "ref": "mock_parent_1", "type": "derived"},
-            {"level": 2, "ref": "mock_parent_2", "type": "source"},
-        ]
+        resolution_chain.append(
+            {
+                "step": "input_normalized",
+                "source_ref": source_ref_clean.replace("\\", "/"),
+            }
+        )
+
+    if source_ref_clean.startswith("tool:"):
+        bare_tool_name = source_ref_clean.split(":", 1)[1].strip()
+        if not bare_tool_name:
+            return _explain_source_error(
+                "invalid_source_ref",
+                "tool: references must include a non-empty registered tool name",
+            )
+
+        if include_chain:
+            resolution_chain.append(
+                {
+                    "step": "registry_checked",
+                    "tool_name": bare_tool_name,
+                    "matched": ContextToolRegistry.get_tool(bare_tool_name) is not None,
+                }
+            )
+
+        tool_def = ContextToolRegistry.get_tool(bare_tool_name)
+        if tool_def is None:
+            return _explain_source_error(
+                "source_not_found",
+                "source_ref did not match a registered tool",
+            )
+
+        if include_chain:
+            resolution_chain.append(
+                {
+                    "step": "resolved",
+                    "source_type": "tool",
+                    "resolver": "registry",
+                }
+            )
+
+        explanation = _build_tool_source_explanation(
+            source_ref=f"tool:{bare_tool_name}",
+            tool_name=bare_tool_name,
+            include_chain=include_chain,
+            resolution_chain=resolution_chain,
+        )
+    elif source_ref_clean.startswith("path:"):
+        bare_path = source_ref_clean.split(":", 1)[1].strip()
+        repo_relative_path = _normalize_repo_relative_path(bare_path)
+        if repo_relative_path is None:
+            return _explain_source_error(
+                "invalid_source_ref",
+                "path: references must use a repo-relative path without absolute prefixes or parent traversal",
+            )
+
+        exists = _repo_relative_file_exists(repo_relative_path)
+        if include_chain:
+            resolution_chain.append(
+                {
+                    "step": "repo_path_checked",
+                    "repo_relative_path": repo_relative_path,
+                    "exists": exists,
+                }
+            )
+
+        if not exists:
+            return _explain_source_error(
+                "source_not_found",
+                "source_ref did not match an existing repo-relative file path",
+            )
+
+        if include_chain:
+            resolution_chain.append(
+                {
+                    "step": "resolved",
+                    "source_type": "file",
+                    "resolver": "repo",
+                }
+            )
+
+        explanation = _build_file_source_explanation(
+            source_ref=f"path:{repo_relative_path}",
+            repo_relative_path=repo_relative_path,
+            include_chain=include_chain,
+            resolution_chain=resolution_chain,
+        )
+    else:
+        tool_def = ContextToolRegistry.get_tool(source_ref_clean)
+        if include_chain:
+            resolution_chain.append(
+                {
+                    "step": "registry_checked",
+                    "tool_name": source_ref_clean,
+                    "matched": tool_def is not None,
+                }
+            )
+
+        if tool_def is not None:
+            if include_chain:
+                resolution_chain.append(
+                    {
+                        "step": "resolved",
+                        "source_type": "tool",
+                        "resolver": "registry",
+                    }
+                )
+
+            explanation = _build_tool_source_explanation(
+                source_ref=source_ref_clean,
+                tool_name=source_ref_clean,
+                include_chain=include_chain,
+                resolution_chain=resolution_chain,
+            )
+        else:
+            repo_relative_path = _normalize_repo_relative_path(source_ref_clean)
+            if repo_relative_path is None:
+                return _explain_source_error(
+                    "invalid_source_ref",
+                    "source_ref path candidates must be repo-relative and must not use absolute prefixes or parent traversal",
+                )
+
+            exists = _repo_relative_file_exists(repo_relative_path)
+            if include_chain:
+                resolution_chain.append(
+                    {
+                        "step": "repo_path_checked",
+                        "repo_relative_path": repo_relative_path,
+                        "exists": exists,
+                    }
+                )
+
+            if not exists:
+                return _explain_source_error(
+                    "source_not_found",
+                    "source_ref must resolve to a registered tool or an existing repo-relative file path",
+                )
+
+            if include_chain:
+                resolution_chain.append(
+                    {
+                        "step": "resolved",
+                        "source_type": "file",
+                        "resolver": "repo",
+                    }
+                )
+
+            explanation = _build_file_source_explanation(
+                source_ref=repo_relative_path,
+                repo_relative_path=repo_relative_path,
+                include_chain=include_chain,
+                resolution_chain=resolution_chain,
+            )
 
     return {
         "tool": "context.explain_source",
         "status": "ok",
-        "explanation": mocked_explanation,
+        "explanation": explanation,
         "metadata": {
-            "explained_at": "2026-05-03T12:00:00Z",
             "include_chain": include_chain,
+            "resolution_mode": "repo_registry_only",
+        },
+    }
+
+
+def context_show_snapshot_handler(**kwargs) -> dict[str, Any]:
+    """
+    Read-only handler for context.show_snapshot tool.
+
+    Returns a deterministic in-memory snapshot of registry truth:
+    which Context MCP tools are currently registered and marked read-only.
+
+    No DB writes. No network. No GitHub. Fail-closed.
+    """
+    snapshot_id = kwargs.get("snapshot_id")
+    include_details = kwargs.get("include_details", True)
+
+    if not snapshot_id or not isinstance(snapshot_id, str) or not snapshot_id.strip():
+        return {
+            "tool": "context.show_snapshot",
+            "status": "error",
+            "error": {
+                "code": "invalid_snapshot_id",
+                "message": "snapshot_id is required and must be a non-empty string",
+            },
+        }
+
+    if not isinstance(include_details, bool):
+        include_details = True
+
+    tool_names = sorted(ContextToolRegistry.list_tool_names())
+    snapshot: dict[str, Any] = {
+        "snapshot_id": snapshot_id.strip(),
+        "tools_count": len(tool_names),
+        "tool_names": tool_names,
+        "read_only_enforced": True,
+        "guardrails": [
+            "Read-only snapshot of registry truth. No DB/network/GitHub access.",
+            "Snapshot is not authorization. LR remains NO-GO.",
+        ],
+    }
+
+    if include_details:
+        details: list[dict[str, Any]] = []
+        for name in tool_names:
+            tool = ContextToolRegistry.get_tool(name)
+            if tool is None:
+                continue
+            details.append(
+                {
+                    "name": tool.name,
+                    "read_only": tool.read_only,
+                    "description": tool.description,
+                }
+            )
+        snapshot["tools"] = details
+
+    return {
+        "tool": "context.show_snapshot",
+        "status": "ok",
+        "snapshot": snapshot,
+    }
+
+
+def context_show_audit_handler(**kwargs) -> dict[str, Any]:
+    """
+    Read-only handler for context.show_audit tool.
+
+    Deterministic audit/dispatch snapshot derived from registry/runtime metadata
+    only. No DB access. No network. No GitHub. No side effects. Fail-closed.
+
+    Notes:
+    - This tool does not provide a DB-backed audit trail.
+    - handler_status is inferred from registry handler wiring (no dispatch).
+    """
+    target_tool_in = kwargs.get("target_tool")
+    entity_id = kwargs.get("entity_id")
+    audit_type = kwargs.get("audit_type", "all")
+    limit = kwargs.get("limit", 50)
+
+    if isinstance(target_tool_in, str) and target_tool_in.strip():
+        target_tool = target_tool_in.strip()
+    elif isinstance(entity_id, str) and entity_id.strip():
+        target_tool = entity_id.strip()
+    else:
+        return {
+            "tool": "context.show_audit",
+            "status": "error",
+            "error": {
+                "code": "invalid_entity_id",
+                "message": (
+                    "target_tool or entity_id is required and must be a non-empty string"
+                ),
+            },
+        }
+
+    audit_type_clean = audit_type.strip() if isinstance(audit_type, str) else "all"
+    if not audit_type_clean:
+        audit_type_clean = "all"
+
+    limit_int = 50
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        limit_int = min(limit, 200)
+
+    tool_def = ContextToolRegistry.get_tool(target_tool)
+    exists = tool_def is not None
+
+    handler_status = "unknown_tool"
+    read_only = False
+    input_schema_keys: list[str] = []
+    output_schema_keys: list[str] = []
+
+    if exists and tool_def is not None:
+        read_only = bool(tool_def.read_only)
+        handler = tool_def.handler
+        if handler is None:
+            handler_status = "not_implemented"
+        else:
+            handler_name = getattr(handler, "__name__", "")
+            if handler_name == "not_implemented_handler":
+                handler_status = "not_implemented"
+            else:
+                handler_status = "implemented"
+
+        input_schema_keys = sorted(
+            list(tool_def.input_schema.get("properties", {}).keys())
+        )[:limit_int]
+        output_schema_keys = sorted(
+            list(tool_def.output_schema.get("properties", {}).keys())
+        )[:limit_int]
+
+    source = "registry"
+    audit_id_payload = {
+        "target_tool": target_tool,
+        "audit_type": audit_type_clean,
+        "limit": limit_int,
+        "exists": exists,
+        "read_only": read_only,
+        "handler_status": handler_status,
+        "input_schema_keys": input_schema_keys,
+        "output_schema_keys": output_schema_keys,
+        "source": source,
+    }
+    digest = hashlib.sha256(
+        json.dumps(audit_id_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    audit_id = f"audit_{digest[:12]}"
+
+    limitations = [
+        "Registry-only audit snapshot (no DB-backed audit trail).",
+        "No handler dispatch performed; handler_status is inferred from wiring.",
+        "No Live-Go / no Echtgeld authorization implied. LR remains NO-GO.",
+    ]
+    if audit_type_clean != "all":
+        limitations.append(
+            "audit_type is accepted for contract compatibility; registry audit ignores it."
+        )
+
+    return {
+        "tool": "context.show_audit",
+        "status": "ok",
+        "audit": {
+            "audit_id": audit_id,
+            "audit_type": audit_type_clean,
+            "target_tool": target_tool,
+            "exists": exists,
+            "read_only": read_only,
+            "handler_status": handler_status,
+            "input_schema_keys": input_schema_keys,
+            "output_schema_keys": output_schema_keys,
+            "guard": {
+                "mutation_blocked": True,
+                "db_writes_allowed": False,
+            },
+            "source": source,
+            "limit": limit_int,
+            "limitations": limitations,
         },
     }
 
@@ -223,12 +644,12 @@ def context_package_handler(**kwargs) -> dict[str, Any]:
     Read-only handler for context.package tool.
 
     Packages context artifacts for handoff between agents or sessions.
-    Uses mocked responses (no live DB/network).
-    Fails closed on invalid inputs.
+    Repo-/registry-only deterministic packaging (no DB/network).
+    Fails closed on invalid inputs and never invents mock artifacts.
     """
     # Validate required artifacts
     artifacts = kwargs.get("artifacts")
-    if not artifacts or not isinstance(artifacts, list):
+    if not artifacts or not isinstance(artifacts, list) or not artifacts:
         return {
             "tool": "context.package",
             "status": "error",
@@ -255,73 +676,278 @@ def context_package_handler(**kwargs) -> dict[str, Any]:
     if not isinstance(include_metadata, bool):
         include_metadata = True
 
-    # Mocked package result (no live DB/network)
-    # Follows #2097 requirements: bounded package, SourceRefs, confidence/freshness/warnings, stop_conditions
-    package_items = []
-    for artifact_id in artifacts[:10]:  # Limit to 10 items
-        package_items.append(
+    scope = kwargs.get("scope", "default")
+    if not isinstance(scope, str) or not scope.strip():
+        scope = "default"
+    scope = scope.strip()
+
+    warnings: list[str] = []
+    truncated = False
+    total_requested = len(artifacts)
+    artifacts_in = artifacts[:10]
+    if total_requested > 10:
+        truncated = True
+        warnings.append("artifacts_limit_exceeded_truncated")
+
+    package_items: list[dict[str, Any]] = []
+    missing_context: list[dict[str, Any]] = []
+    normalized_inputs: list[str] = []
+    package_source_refs: list[str] = []
+
+    def _safe_artifact_echo(value: str) -> str:
+        candidate = value.strip()
+        prefix: str | None = None
+        if candidate.startswith("tool:"):
+            prefix = "tool:"
+            candidate = candidate.split(":", 1)[1]
+        elif candidate.startswith("path:"):
+            prefix = "path:"
+            candidate = candidate.split(":", 1)[1]
+
+        candidate_norm = candidate.strip().replace("\\", "/")
+        if not candidate_norm:
+            safe = ""
+        elif candidate_norm.startswith("/") or candidate_norm.startswith("//"):
+            safe = "<rejected:absolute_path>"
+        elif candidate_norm.startswith("\\\\"):
+            safe = "<rejected:unc_path>"
+        elif re.match(r"^[A-Za-z]:", candidate_norm):
+            safe = "<rejected:drive_path>"
+        elif ".." in PurePosixPath(candidate_norm).parts:
+            safe = "<rejected:path_traversal>"
+        else:
+            safe = value
+
+        if prefix is None or safe == value:
+            return safe
+        return f"{prefix}{safe}"
+
+    def _reject_missing(artifact_value: Any, code: str, message: str) -> None:
+        artifact_text = (
+            artifact_value if isinstance(artifact_value, str) else str(artifact_value)
+        )
+        missing_context.append(
             {
-                "id": artifact_id,
-                "type": "evidence",
-                "summary": f"Mock summary for {artifact_id}",
-                "source_refs": [f"src_{artifact_id}_1", f"src_{artifact_id}_2"],
-                "confidence": 0.85,
-                "freshness": "2026-05-03T00:00:00Z",
+                "artifact": _safe_artifact_echo(artifact_text),
+                "code": code,
+                "message": message,
             }
         )
 
-    warnings = []
-    if len(artifacts) > 10:
-        warnings.append("artifacts_limit_exceeded_truncated")
-    if len(package_items) == 0:
-        warnings.append("empty_package")
+    for artifact in artifacts_in:
+        if not isinstance(artifact, str):
+            # Keep package_id unique even for rejected entries.
+            normalized_inputs.append(
+                "invalid_type:"
+                + type(artifact).__name__
+                + ":"
+                + _safe_artifact_echo(str(artifact))
+            )
+            _reject_missing(
+                artifact,
+                "invalid_artifact_type",
+                "artifact entries must be strings",
+            )
+            continue
 
-    missing_context = []
-    if len(artifacts) == 0:
-        missing_context.append("no_artifacts_provided")
+        raw_ref = artifact.strip()
+        if not raw_ref:
+            # Different empty/whitespace inputs should not collapse to the same package_id.
+            normalized_inputs.append(f"invalid_empty:{len(artifact)}")
+            _reject_missing(
+                artifact,
+                "invalid_source_ref",
+                "artifact reference must be a non-empty string",
+            )
+            continue
 
-    package = {
-        "request_scope": kwargs.get("scope", "default"),
-        "query_summary": f"Package request for {len(artifacts)} artifacts",
-        "top_artifacts": package_items[:5],
-        "top_docs": [],
-        "top_symbols": [],
-        "graph_paths": [],
-        "source_refs": [
-            item
-            for sub in [a.get("source_refs", []) for a in package_items]
-            for item in sub
-        ],
-        "confidence_summary": {"average": 0.85, "lowest": 0.8, "highest": 0.9},
-        "warnings": warnings,
-        "stale_flags": [],
-        "missing_context": missing_context,
-        "recommended_next_queries": [],
-        "stop_conditions": [
-            "no_live_go",
-            "no_echtgeld_authorization",
-            "no_risk_approval",
-        ],
-    }
+        # ---- tool: prefix (registry only) ----
+        if raw_ref.startswith("tool:"):
+            tool_name = raw_ref.split(":", 1)[1].strip()
+            normalized_inputs.append(f"tool:{tool_name}" if tool_name else "tool:")
+            if not tool_name:
+                _reject_missing(
+                    raw_ref,
+                    "invalid_source_ref",
+                    "tool: references must include a non-empty registered tool name",
+                )
+                continue
+
+            tool_def = ContextToolRegistry.get_tool(tool_name)
+            if tool_def is None:
+                _reject_missing(
+                    f"tool:{tool_name}",
+                    "source_not_found",
+                    "artifact did not match a registered tool",
+                )
+                continue
+
+            src_ref = f"tool:{tool_name}"
+            package_source_refs.append(src_ref)
+            package_items.append(
+                {
+                    "id": tool_name,
+                    "type": "tool",
+                    "summary": f"Registry tool {tool_name}",
+                    "source_refs": [src_ref],
+                    "confidence": None,
+                    "freshness": None,
+                    "metadata": {
+                        "read_only": bool(tool_def.read_only),
+                        "handler_status": _infer_handler_status(tool_def),
+                    },
+                }
+            )
+            continue
+
+        # ---- path: prefix (repo file only) ----
+        if raw_ref.startswith("path:"):
+            bare_path = raw_ref.split(":", 1)[1].strip()
+            repo_relative_path = _normalize_repo_relative_path(bare_path)
+            if repo_relative_path is None:
+                # Keep package_id unique even for rejected path: entries without leaking absolute paths.
+                normalized_inputs.append(
+                    "path_invalid:" + _safe_artifact_echo(bare_path or "<empty>")
+                )
+                _reject_missing(
+                    raw_ref,
+                    "invalid_source_ref",
+                    "path: references must use a repo-relative path without absolute prefixes or parent traversal",
+                )
+                continue
+            normalized_inputs.append(f"path:{repo_relative_path}")
+
+            if not _repo_relative_file_exists(repo_relative_path):
+                _reject_missing(
+                    f"path:{repo_relative_path}",
+                    "source_not_found",
+                    "artifact did not match an existing repo-relative file path",
+                )
+                continue
+
+            src_ref = f"path:{repo_relative_path}"
+            package_source_refs.append(src_ref)
+            package_items.append(
+                {
+                    "id": repo_relative_path,
+                    "type": "file",
+                    "summary": f"Repo file {repo_relative_path}",
+                    "source_refs": [src_ref],
+                    "confidence": None,
+                    "freshness": None,
+                    "metadata": {
+                        "repo_relative_path": repo_relative_path,
+                    },
+                }
+            )
+            continue
+
+        # ---- no prefix: prefer exact tool match, else repo-relative file ----
+        tool_def = ContextToolRegistry.get_tool(raw_ref)
+        if tool_def is not None:
+            normalized_inputs.append(raw_ref)
+            src_ref = f"tool:{raw_ref}"
+            package_source_refs.append(src_ref)
+            package_items.append(
+                {
+                    "id": raw_ref,
+                    "type": "tool",
+                    "summary": f"Registry tool {raw_ref}",
+                    "source_refs": [src_ref],
+                    "confidence": None,
+                    "freshness": None,
+                    "metadata": {
+                        "read_only": bool(tool_def.read_only),
+                        "handler_status": _infer_handler_status(tool_def),
+                    },
+                }
+            )
+            continue
+
+        repo_relative_path = _normalize_repo_relative_path(raw_ref)
+        normalized_inputs.append(repo_relative_path or raw_ref.replace("\\", "/"))
+        if repo_relative_path is None:
+            _reject_missing(
+                raw_ref,
+                "invalid_source_ref",
+                "artifact path candidates must be repo-relative and must not use absolute prefixes or parent traversal",
+            )
+            continue
+
+        if not _repo_relative_file_exists(repo_relative_path):
+            _reject_missing(
+                repo_relative_path,
+                "source_not_found",
+                "artifact did not match a registered tool or an existing repo-relative file path",
+            )
+            continue
+
+        src_ref = f"path:{repo_relative_path}"
+        package_source_refs.append(src_ref)
+        package_items.append(
+            {
+                "id": repo_relative_path,
+                "type": "file",
+                "summary": f"Repo file {repo_relative_path}",
+                "source_refs": [src_ref],
+                "confidence": None,
+                "freshness": None,
+                "metadata": {
+                    "repo_relative_path": repo_relative_path,
+                },
+            }
+        )
+
+    if missing_context:
+        warnings.append("some_artifacts_unresolved")
+
+    # Deterministic, stable ordering
+    package_source_refs = sorted(set(package_source_refs))
+    missing_context = sorted(
+        [dict(entry) for entry in missing_context],
+        key=lambda item: (item.get("artifact", ""), item.get("code", "")),
+    )
 
     return {
         "tool": "context.package",
         "status": "ok",
         "package": {
             "format": format_opt,
-            "items": package_items[:10],
-            "created_at": "2026-05-03T12:00:00Z",
-            "package_id": f"pkg_{'-'.join(str(a) for a in sorted(artifacts[:10]))}",
+            "items": package_items,
+            "created_at": None,
+            "package_id": (
+                "pkg_"
+                + hashlib.sha256(
+                    json.dumps(
+                        {
+                            "scope": scope,
+                            "format": format_opt,
+                            "artifacts": normalized_inputs,
+                            "truncated": truncated,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()[:12]
+            ),
             "warnings": warnings,
-            "stale_flags": package.get("stale_flags", []),
+            "stale_flags": [],
             "missing_context": missing_context,
-            "stop_conditions": package["stop_conditions"],
+            "source_refs": package_source_refs,
+            "stop_conditions": [
+                "no_live_go",
+                "no_echtgeld_authorization",
+                "no_risk_approval",
+            ],
             "metadata": (
                 {
                     "include_metadata": include_metadata,
-                    "scope": package["request_scope"],
-                    "truncated": len(artifacts) > 10,
-                    "total_requested": len(artifacts),
+                    "scope": scope,
+                    "truncated": truncated,
+                    "total_requested": total_requested,
+                    "total_resolved": len(package_items),
+                    "total_missing": len(missing_context),
+                    "resolver": "repo-registry",
                 }
                 if include_metadata
                 else {}
@@ -585,15 +1211,20 @@ def context_readiness_handler(**kwargs) -> dict[str, Any]:
         ]
 
     # --- Validate operation_mode against contract enum ---
-    VALID_OPERATION_MODES = frozenset({
-        "read_only",
-        "dry_run",
-        "write (code/docs)",
-        "write (config/infra)",
-        "write (DB/migration)",
-        "write (MCP live)",
-    })
-    if not isinstance(operation_mode, str) or operation_mode not in VALID_OPERATION_MODES:
+    VALID_OPERATION_MODES = frozenset(
+        {
+            "read_only",
+            "dry_run",
+            "write (code/docs)",
+            "write (config/infra)",
+            "write (DB/migration)",
+            "write (MCP live)",
+        }
+    )
+    if (
+        not isinstance(operation_mode, str)
+        or operation_mode not in VALID_OPERATION_MODES
+    ):
         valid_operation_modes = ", ".join(sorted(VALID_OPERATION_MODES))
         invalid_mode_stop = (
             f"S1: invalid operation_mode — must be one of: {valid_operation_modes}"
@@ -653,13 +1284,16 @@ def context_readiness_handler(**kwargs) -> dict[str, Any]:
     paths_lower = " ".join(target_paths).lower()
 
     triggers = ["trading", "risk", "execution", "strategy"]
-    touches_trading_risk = any(
-        t in task_lower or t in paths_lower for t in triggers
-    )
+    touches_trading_risk = any(t in task_lower or t in paths_lower for t in triggers)
 
     live_kw = [
-        "live", "echtgeld", "production deploy", "go-live",
-        "live readiness", "lr-go", "live trading authorization",
+        "live",
+        "echtgeld",
+        "production deploy",
+        "go-live",
+        "live readiness",
+        "lr-go",
+        "live trading authorization",
     ]
     has_live_claim = any(kw in task_lower for kw in live_kw)
 
@@ -714,9 +1348,7 @@ def context_readiness_handler(**kwargs) -> dict[str, Any]:
         for r in missing_reads:
             output_stop_conditions.append(f"S3: minimum read unavailable: {r}")
     if not context_package_ref and not required_reads:
-        output_stop_conditions.append(
-            "S2: no context package and no required reads"
-        )
+        output_stop_conditions.append("S2: no context package and no required reads")
     if is_write and not impact_refs:
         output_stop_conditions.append("S6: write without impact report")
     if not stop_conditions_in:
@@ -724,9 +1356,7 @@ def context_readiness_handler(**kwargs) -> dict[str, Any]:
     if is_write and not evidence_refs:
         output_stop_conditions.append("S4: core assumptions lack evidence")
     if has_live_claim:
-        output_stop_conditions.append(
-            "S8: live/echtgeld claims outside LR SSOT"
-        )
+        output_stop_conditions.append("S8: live/echtgeld claims outside LR SSOT")
     if touches_trading_risk and is_write:
         output_stop_conditions.append("S7: trading/risk/execution scope touched")
 
@@ -755,9 +1385,7 @@ def context_readiness_handler(**kwargs) -> dict[str, Any]:
             "Context sufficient. Write operation or trading/risk scope "
             "requires Human-GO."
         )
-        guardrails.append(
-            "Stop. Request Human-GO. Do not write until approved."
-        )
+        guardrails.append("Stop. Request Human-GO. Do not write until approved.")
     elif operation_mode == "dry_run":
         status = "ready_for_dry_run"
         reasons.append("Dry-run mode. Plan and preview, but do not execute.")
@@ -790,6 +1418,124 @@ def context_readiness_handler(**kwargs) -> dict[str, Any]:
     }
 
 
+def _briefing_error_from_inner_result(
+    result: dict[str, Any],
+    *,
+    tool_name: str = "context.briefing",
+) -> dict[str, Any]:
+    """Project an inner MCP-style error result onto the briefing tool surface."""
+    error = result.get("error", {}) if isinstance(result, dict) else {}
+    projected: dict[str, Any] = {
+        "tool": tool_name,
+        "status": "error",
+        "error": {
+            "code": error.get("code", "execution_error"),
+            "message": error.get(
+                "message", "briefing DB-backed preflight failed unexpectedly"
+            ),
+        },
+    }
+    details = error.get("details")
+    if isinstance(details, dict):
+        projected["error"]["details"] = deepcopy(details)
+
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        projected["metadata"] = deepcopy(metadata)
+    return projected
+
+
+def _has_non_empty_record_list(value: Any) -> bool:
+    return isinstance(value, list) and bool(value)
+
+
+def _derive_briefing_brain_context(
+    *,
+    adapter_config_path: Any,
+    secrets_path: Any,
+    enrichment_scope: str,
+    evidence_records: Any,
+    claim_records: Any,
+    decision_events: Any,
+    memory_records: Any,
+    caller_brain_source: Any,
+    caller_brain_status: Any,
+) -> tuple[str, str, list[str]] | dict[str, Any]:
+    """Derive briefing brain context from real reads or conservative fallbacks."""
+    limitations: list[str] = []
+
+    if caller_brain_source is not None:
+        limitations.append(
+            "brain_source caller input ignored; derived from actual context source"
+        )
+    if caller_brain_status is not None:
+        limitations.append(
+            "brain_status caller input ignored; derived from actual context source"
+        )
+
+    if adapter_config_path is not None:
+        from tools.mcp.context_evidence_memory_tools import (
+            handle_cdb_context_trust_summary,
+        )
+
+        trust_summary_request: dict[str, Any] = {
+            "tool": "cdb_context_trust_summary",
+            "parameters": {
+                "adapter_config_path": adapter_config_path,
+                "scope": enrichment_scope,
+            },
+        }
+        if secrets_path is not None:
+            trust_summary_request["parameters"]["secrets_path"] = secrets_path
+
+        trust_summary_result = handle_cdb_context_trust_summary(trust_summary_request)
+        if trust_summary_result.get("status") != "ok":
+            return _briefing_error_from_inner_result(trust_summary_result)
+
+        metadata = trust_summary_result.get("metadata", {})
+        source = metadata.get("source")
+        if source != "surrealdb-local":
+            return {
+                "tool": "context.briefing",
+                "status": "error",
+                "error": {
+                    "code": "adapter_unavailable",
+                    "message": (
+                        "DB-backed briefing requested, but the Wave-14 adapter did "
+                        f"not return source='surrealdb-local' (got {source!r})"
+                    ),
+                    "details": {
+                        "expected_source": "surrealdb-local",
+                        "actual_source": source,
+                    },
+                },
+                "metadata": deepcopy(metadata) if isinstance(metadata, dict) else {},
+            }
+
+        limitations.append(
+            "brain context derived from Wave-14 trust summary adapter metadata"
+        )
+        return "surrealdb-local", "used", limitations
+
+    if any(
+        (
+            _has_non_empty_record_list(evidence_records),
+            _has_non_empty_record_list(claim_records),
+            _has_non_empty_record_list(decision_events),
+            _has_non_empty_record_list(memory_records),
+        )
+    ):
+        limitations.append(
+            "brain context derived from inline enrichment records (in-memory)"
+        )
+        return "in_memory", "used", limitations
+
+    limitations.append(
+        "brain_source derived as repo-only; no DB-backed memory or evidence claims"
+    )
+    return "repo-only", "not-used", limitations
+
+
 def context_briefing_handler(**kwargs) -> dict[str, Any]:
     """
     Read-only handler for context.briefing tool.
@@ -809,11 +1555,11 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
 
     _MISSING = object()
 
-    # --- Input extraction (no defaults for required fields) ---
+    # --- Input extraction (defaults only for optional briefing context) ---
     task_id = kwargs.get("task_id")
     task_scope = kwargs.get("task_scope")
-    target_issue = kwargs.get("target_issue", _MISSING)
-    requested_depth = kwargs.get("requested_depth", _MISSING)
+    target_issue = kwargs.get("target_issue", None)
+    requested_depth = kwargs.get("requested_depth", "quick")
     operation_mode = kwargs.get("operation_mode", _MISSING)
     target_paths = kwargs.get("target_paths", [])
     target_symbols = kwargs.get("target_symbols", [])
@@ -827,6 +1573,14 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
     _decision_events_raw = kwargs.get("decision_events")
     _memory_records_raw = kwargs.get("memory_records")
     _enrichment_scope = kwargs.get("enrichment_scope", "wave14")
+    _adapter_config_path = kwargs.get("adapter_config_path")
+    _secrets_path = kwargs.get("secrets_path")
+    _repo_state_raw = kwargs.get("repo_state")
+    _github_state_raw = kwargs.get("github_state")
+    _brain_source_raw = kwargs.get("brain_source")
+    _brain_status_raw = kwargs.get("brain_status")
+    _working_assumptions_raw = kwargs.get("working_assumptions")
+    _session_limitations_raw = kwargs.get("limitations")
     if not isinstance(_enrichment_scope, str) or not _enrichment_scope.strip():
         _enrichment_scope = "wave14"
     else:
@@ -853,16 +1607,6 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
             },
         }
 
-    if target_issue is _MISSING:
-        return {
-            "tool": "context.briefing",
-            "status": "error",
-            "error": {
-                "code": "invalid_target_issue",
-                "message": "target_issue is required (must be a string or null)",
-            },
-        }
-
     if target_issue is not None and not isinstance(target_issue, str):
         return {
             "tool": "context.briefing",
@@ -870,16 +1614,6 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
             "error": {
                 "code": "invalid_target_issue",
                 "message": "target_issue must be a string or null",
-            },
-        }
-
-    if requested_depth is _MISSING:
-        return {
-            "tool": "context.briefing",
-            "status": "error",
-            "error": {
-                "code": "invalid_depth",
-                "message": "requested_depth is required",
             },
         }
 
@@ -907,14 +1641,16 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
             },
         }
 
-    valid_modes = frozenset({
-        "read_only",
-        "dry_run",
-        "write (code/docs)",
-        "write (config/infra)",
-        "write (DB/migration)",
-        "write (MCP live)",
-    })
+    valid_modes = frozenset(
+        {
+            "read_only",
+            "dry_run",
+            "write (code/docs)",
+            "write (config/infra)",
+            "write (DB/migration)",
+            "write (MCP live)",
+        }
+    )
     if not isinstance(operation_mode, str) or operation_mode not in valid_modes:
         return {
             "tool": "context.briefing",
@@ -931,6 +1667,122 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
     if risk_level not in frozenset({"low", "medium", "high"}):
         risk_level = "medium"
 
+    valid_working_tree_states = frozenset({"clean", "dirty", "unknown"})
+    session_context_limitations: list[str] = []
+    brain_context = _derive_briefing_brain_context(
+        adapter_config_path=_adapter_config_path,
+        secrets_path=_secrets_path,
+        enrichment_scope=_enrichment_scope,
+        evidence_records=_evidence_records_raw,
+        claim_records=_claim_records_raw,
+        decision_events=_decision_events_raw,
+        memory_records=_memory_records_raw,
+        caller_brain_source=_brain_source_raw,
+        caller_brain_status=_brain_status_raw,
+    )
+    if isinstance(brain_context, dict):
+        return brain_context
+    brain_source, brain_status, derived_brain_limitations = brain_context
+    session_context_limitations.extend(derived_brain_limitations)
+
+    repo_state = {
+        "branch": "unknown",
+        "commit": "unknown",
+        "working_tree": "unknown",
+    }
+    if isinstance(_repo_state_raw, dict):
+        repo_branch = _repo_state_raw.get("branch")
+        repo_commit = _repo_state_raw.get("commit")
+        repo_working_tree = _repo_state_raw.get("working_tree")
+
+        if isinstance(repo_branch, str) and repo_branch.strip():
+            repo_state["branch"] = repo_branch.strip()
+        else:
+            session_context_limitations.append(
+                "repo_state.branch missing or malformed; using unknown"
+            )
+
+        if isinstance(repo_commit, str) and repo_commit.strip():
+            repo_state["commit"] = repo_commit.strip()
+        else:
+            session_context_limitations.append(
+                "repo_state.commit missing or malformed; using unknown"
+            )
+
+        if repo_working_tree in valid_working_tree_states:
+            repo_state["working_tree"] = repo_working_tree
+        else:
+            session_context_limitations.append(
+                "repo_state.working_tree missing or malformed; using unknown"
+            )
+    else:
+        session_context_limitations.append(
+            "repo_state not provided; using unknown repo state"
+        )
+
+    github_state = {
+        "target_issue": target_issue if isinstance(target_issue, str) else None,
+        "related_prs": [],
+        "open_epics": [],
+    }
+    if isinstance(_github_state_raw, dict):
+        github_target_issue = _github_state_raw.get("target_issue")
+        if github_target_issue is None or isinstance(github_target_issue, str):
+            github_state["target_issue"] = github_target_issue
+        else:
+            session_context_limitations.append(
+                "github_state.target_issue malformed; using request target_issue or null"
+            )
+
+        for field_name in ("related_prs", "open_epics"):
+            field_value = _github_state_raw.get(field_name)
+            if isinstance(field_value, list):
+                github_state[field_name] = [
+                    item for item in field_value if isinstance(item, str)
+                ]
+                if len(github_state[field_name]) != len(field_value):
+                    session_context_limitations.append(
+                        f"github_state.{field_name} contained non-string entries; dropped invalid items"
+                    )
+            elif field_value is not None:
+                session_context_limitations.append(
+                    f"github_state.{field_name} malformed; using empty list"
+                )
+    else:
+        session_context_limitations.append(
+            "github_state not provided; using request target_issue and empty related PR/epic lists"
+        )
+
+    working_assumptions = []
+    if isinstance(_working_assumptions_raw, list):
+        working_assumptions = [
+            item for item in _working_assumptions_raw if isinstance(item, str)
+        ]
+        if len(working_assumptions) != len(_working_assumptions_raw):
+            session_context_limitations.append(
+                "working_assumptions contained non-string entries; dropped invalid items"
+            )
+    elif _working_assumptions_raw is not None:
+        session_context_limitations.append(
+            "working_assumptions malformed; using empty list"
+        )
+
+    if isinstance(_session_limitations_raw, list):
+        caller_limitations = [
+            item for item in _session_limitations_raw if isinstance(item, str)
+        ]
+        session_context_limitations.extend(caller_limitations)
+        if len(caller_limitations) != len(_session_limitations_raw):
+            session_context_limitations.append(
+                "limitations contained non-string entries; dropped invalid items"
+            )
+    elif _session_limitations_raw is not None:
+        session_context_limitations.append(
+            "limitations malformed; using generated limitations"
+        )
+
+    session_context_limitations_norm = list(dict.fromkeys(session_context_limitations))
+
     # --- Normalize arrays ---
     if not isinstance(target_paths, list):
         target_paths = []
@@ -944,7 +1796,9 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
     target_symbols_norm = [str(s) for s in target_symbols if isinstance(s, str)]
     target_concepts_norm = [str(c) for c in target_concepts if isinstance(c, str)]
     agent_type_norm = agent_type.strip() if isinstance(agent_type, str) else ""
-    risk_level_norm = risk_level if risk_level in frozenset({"low", "medium", "high"}) else "medium"
+    risk_level_norm = (
+        risk_level if risk_level in frozenset({"low", "medium", "high"}) else "medium"
+    )
 
     request_for_hash: dict[str, Any] = {
         "task_id": task_id.strip(),
@@ -957,6 +1811,12 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         "operation_mode": operation_mode,
         "agent_type": agent_type_norm,
         "risk_level": risk_level_norm,
+        "repo_state": repo_state,
+        "github_state": github_state,
+        "brain_source": brain_source,
+        "brain_status": brain_status,
+        "working_assumptions": working_assumptions,
+        "limitations": session_context_limitations_norm,
     }
     briefing_id = hashlib.sha256(
         json.dumps(request_for_hash, sort_keys=True).encode()
@@ -1010,9 +1870,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
             if sc_text not in stop_conditions:
                 stop_conditions.append(sc_text)
     except Exception as e:
-        resolver_error = (
-            f"stop resolver unavailable: {type(e).__name__}: {e}"
-        )
+        resolver_error = f"stop resolver unavailable: {type(e).__name__}: {e}"
 
     # --- Guardrails (always present) ---
     guardrails = [
@@ -1026,7 +1884,9 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
     ]
 
     # --- Required reads (from readiness, minimum baseline always present) ---
-    required_reads = readiness.get("required_next_reads", MINIMUM_READS) or MINIMUM_READS
+    required_reads = (
+        readiness.get("required_next_reads", MINIMUM_READS) or MINIMUM_READS
+    )
 
     # --- Delegate to context.package for standard/deep depth ---
     package_artifacts: list[dict[str, Any]] = []
@@ -1039,7 +1899,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
 
     if requested_depth in ("standard", "deep"):
         package_result = context_package_handler(
-            artifacts=["briefing_artifact_001", "briefing_artifact_002"],
+            artifacts=["context.readiness", "AGENTS.md"],
             format="json",
         )
         pkg = package_result.get("package", {})
@@ -1093,7 +1953,9 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
             )
 
     # --- Agent attribution for scope summary ---
-    agent_label = f" [{agent_type.strip()}]" if agent_type and agent_type.strip() else ""
+    agent_label = (
+        f" [{agent_type.strip()}]" if agent_type and agent_type.strip() else ""
+    )
 
     # --- Depth-dependent content ---
     if requested_depth == "quick":
@@ -1135,8 +1997,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         )
     if not target_paths and not target_symbols:
         known_risks.append(
-            "no target_paths or target_symbols specified; "
-            "context may be minimal"
+            "no target_paths or target_symbols specified; " "context may be minimal"
         )
 
     # --- Surface resolver failure ---
@@ -1183,6 +2044,27 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         }
     )
 
+    db_claims_allowed = brain_source == "surrealdb-local" and brain_status in frozenset(
+        {"used", "partial"}
+    )
+
+    session_context = {
+        "memory_type": "working_memory",
+        "session_only": True,
+        "ttl_seconds": 14400,
+        "brain_source": brain_source,
+        "brain_status": brain_status,
+        "repo_state": repo_state,
+        "github_state": github_state,
+        "agent_operating_mode": {
+            "operation_mode": operation_mode,
+            "human_go_required": human_go_required,
+            "db_claims_allowed": db_claims_allowed,
+        },
+        "working_assumptions": working_assumptions,
+        "limitations": session_context_limitations_norm,
+    }
+
     # --- Enrichment (#2122) ---
     enrichment_id = hashlib.sha256(
         (briefing_id + requested_depth).encode()
@@ -1197,27 +2079,39 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
     blocking_trust_findings: list[str] = []
     recommended_next_reads_enrichment: list[str] = []
 
-    _has_records = any([
-        isinstance(_evidence_records_raw, list) and bool(_evidence_records_raw),
-        isinstance(_claim_records_raw, list) and bool(_claim_records_raw),
-        isinstance(_decision_events_raw, list) and bool(_decision_events_raw),
-        isinstance(_memory_records_raw, list) and bool(_memory_records_raw),
-    ])
+    _has_records = any(
+        [
+            isinstance(_evidence_records_raw, list) and bool(_evidence_records_raw),
+            isinstance(_claim_records_raw, list) and bool(_claim_records_raw),
+            isinstance(_decision_events_raw, list) and bool(_decision_events_raw),
+            isinstance(_memory_records_raw, list) and bool(_memory_records_raw),
+        ]
+    )
 
     if not _has_records:
-        # Fail-closed: no records provided — controlled-empty enrichment
-        missing_evidence_notice = [
-            "no_evidence_records_provided",
-            "no_decision_events_provided",
-        ]
-        trust_summary = (
-            "Enrichment skipped: no evidence_records, claim_records, decision_events, "
-            "or memory_records provided. Supply records to enable evidence/decision enrichment."
-        )
-        stop_conditions.append(
-            "S5: no enrichment records provided — supply evidence_records, claim_records, "
-            "decision_events, or memory_records to enable enrichment"
-        )
+        if brain_source == "surrealdb-local":
+            trust_summary = (
+                "DB-backed session context established via Wave-14 trust summary. "
+                "Artifact enrichment skipped because no inline enrichment records "
+                "were provided to context.briefing."
+            )
+            recommended_next_reads_enrichment.append(
+                "Provide inline enrichment records if artifact-level enrichment is required in the briefing payload"
+            )
+        else:
+            # Fail-closed: no records provided — controlled-empty enrichment
+            missing_evidence_notice = [
+                "no_evidence_records_provided",
+                "no_decision_events_provided",
+            ]
+            trust_summary = (
+                "Enrichment skipped: no evidence_records, claim_records, decision_events, "
+                "or memory_records provided. Supply records to enable evidence/decision enrichment."
+            )
+            stop_conditions.append(
+                "S5: no enrichment records provided — supply evidence_records, claim_records, "
+                "decision_events, or memory_records to enable enrichment"
+            )
     else:
         # Real enrichment using Wave-14 services (#2122)
         # Read-only, fail-closed, no DB/network/write.
@@ -1266,8 +2160,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                 # Filter matched evidence to requested scope — by_freshness does not
                 # filter by scope, unlike claim/decision/memory enrichers.
                 _matched_ev = [
-                    ev for ev in _matched_ev
-                    if ev.get("scope") == _enrichment_scope
+                    ev for ev in _matched_ev if ev.get("scope") == _enrichment_scope
                 ]
                 enriched_evidence = [
                     {
@@ -1287,7 +2180,8 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                 # None, ints) must not reach .get() or they raise AttributeError.
                 _matched_ev_ids = {_ev.get("evidence_id") for _ev in _matched_ev}
                 _undated_recs = [
-                    rec for rec in _evidence_records_raw
+                    rec
+                    for rec in _evidence_records_raw
                     if isinstance(rec, dict)
                     and not rec.get("created_at")
                     and rec.get("evidence_id") not in _matched_ev_ids
@@ -1302,15 +2196,17 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                     )
                 if _undated_recs:
                     for _urec in _undated_recs[:20]:
-                        enriched_evidence.append({
-                            "evidence_id": _urec.get("evidence_id"),
-                            "title": _urec.get("title"),
-                            "confidence": _urec.get("confidence"),
-                            "stale": _urec.get("stale"),
-                            "blocking_missing": _urec.get("blocking_missing"),
-                            "evidence_type": _urec.get("evidence_type"),
-                            "scope": _urec.get("scope"),
-                        })
+                        enriched_evidence.append(
+                            {
+                                "evidence_id": _urec.get("evidence_id"),
+                                "title": _urec.get("title"),
+                                "confidence": _urec.get("confidence"),
+                                "stale": _urec.get("stale"),
+                                "blocking_missing": _urec.get("blocking_missing"),
+                                "evidence_type": _urec.get("evidence_type"),
+                                "scope": _urec.get("scope"),
+                            }
+                        )
                     _undated_ids = [r.get("evidence_id") for r in _undated_recs]
                     blocking_trust_findings.append(
                         f"undated_evidence_missing_created_at: {_undated_ids}"
@@ -1320,9 +2216,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                     )
                 _stale_ev_ids = _evidence_service_result.get("stale_evidence_ids", [])
                 if _stale_ev_ids:
-                    stale_evidence_notice.append(
-                        f"stale_evidence: {_stale_ev_ids}"
-                    )
+                    stale_evidence_notice.append(f"stale_evidence: {_stale_ev_ids}")
                     recommended_next_reads_enrichment.append(
                         "Review stale evidence before proceeding"
                     )
@@ -1347,7 +2241,8 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         if isinstance(_claim_records_raw, list) and _claim_records_raw:
             try:
                 _scoped_claims = [
-                    r for r in _claim_records_raw
+                    r
+                    for r in _claim_records_raw
                     if isinstance(r, dict) and r.get("scope") == _enrichment_scope
                 ]
                 _cl_req = ClaimResolveRequest(
@@ -1370,7 +2265,8 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         if isinstance(_decision_events_raw, list) and _decision_events_raw:
             try:
                 _scoped_decisions = [
-                    r for r in _decision_events_raw
+                    r
+                    for r in _decision_events_raw
                     if isinstance(r, dict) and r.get("scope") == _enrichment_scope
                 ]
                 _dec_req = DecisionHistoryQueryRequest(
@@ -1384,8 +2280,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                     _matched_dec = _decision_service_result.get("matched_decisions", [])
                     # Post-filter to exact scope as defence-in-depth.
                     _matched_dec = [
-                        d for d in _matched_dec
-                        if d.get("scope") == _enrichment_scope
+                        d for d in _matched_dec if d.get("scope") == _enrichment_scope
                     ]
                     enriched_decisions = [
                         {
@@ -1406,9 +2301,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                     mode="by_scope",
                     scope=_enrichment_scope,
                 )
-                _memory_service_result = read_memory_v1(
-                    _memory_records_raw, _mem_req
-                )
+                _memory_service_result = read_memory_v1(_memory_records_raw, _mem_req)
                 _matched_mem = _memory_service_result.get("matched_memory", [])
                 enriched_memory = [
                     {
@@ -1423,9 +2316,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
                 ]
                 _stale_mem_ids = _memory_service_result.get("stale_memory_ids", [])
                 if _stale_mem_ids:
-                    stale_evidence_notice.append(
-                        f"stale_memory: {_stale_mem_ids}"
-                    )
+                    stale_evidence_notice.append(f"stale_memory: {_stale_mem_ids}")
             except MemoryReadError as _e:
                 known_risks.append(f"memory_read_error: {_e}")
 
@@ -1433,11 +2324,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         try:
             _ts_req = TrustSummaryRequest(
                 scope=_enrichment_scope,
-                topic=(
-                    target_concepts_norm[0]
-                    if target_concepts_norm
-                    else None
-                ),
+                topic=(target_concepts_norm[0] if target_concepts_norm else None),
             )
             _ts_result = build_trust_summary_v1(
                 _ts_req,
@@ -1450,14 +2337,10 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
             _composite_score = _ts_result.get("composite_score", 0.0)
             _ts_blocking = _ts_result.get("blocking_trust_findings", [])
             if _ts_blocking:
-                blocking_trust_findings.extend(
-                    [str(_f) for _f in _ts_blocking]
-                )
+                blocking_trust_findings.extend([str(_f) for _f in _ts_blocking])
             _stale_ts_flags = _ts_result.get("stale_flags", [])
             if _stale_ts_flags:
-                stale_evidence_notice.extend(
-                    [str(_f) for _f in _stale_ts_flags]
-                )
+                stale_evidence_notice.extend([str(_f) for _f in _stale_ts_flags])
             trust_summary = (
                 f"Trust level: {_trust_level}. "
                 f"Composite score: {_composite_score:.2f}. "
@@ -1508,6 +2391,7 @@ def context_briefing_handler(**kwargs) -> dict[str, Any]:
         "blocking_trust_findings": blocking_trust_findings,
         "recommended_next_reads": recommended_next_reads_enrichment,
         "approval_semantics": {"no_echtgeld_go": True},
+        "session_context": session_context,
         "dependency_paths": dependency_paths,
         "known_risks": known_risks,
         "guardrails": guardrails,
@@ -1617,14 +2501,16 @@ def context_stop_resolver_handler(**kwargs) -> dict[str, Any]:
     if readiness_result_in is not None and not isinstance(readiness_result_in, dict):
         readiness_result_in = None
 
-    valid_modes = frozenset({
-        "read_only",
-        "dry_run",
-        "write (code/docs)",
-        "write (config/infra)",
-        "write (DB/migration)",
-        "write (MCP live)",
-    })
+    valid_modes = frozenset(
+        {
+            "read_only",
+            "dry_run",
+            "write (code/docs)",
+            "write (config/infra)",
+            "write (DB/migration)",
+            "write (MCP live)",
+        }
+    )
     if not isinstance(operation_mode, str) or operation_mode not in valid_modes:
         operation_mode = "read_only"
 
@@ -1731,7 +2617,10 @@ def context_required_reads_handler(**kwargs) -> dict[str, Any]:
             },
         }
 
-    if not isinstance(operation_mode, str) or operation_mode not in VALID_OPERATION_MODES:
+    if (
+        not isinstance(operation_mode, str)
+        or operation_mode not in VALID_OPERATION_MODES
+    ):
         return {
             "tool": "context.required_reads",
             "status": "error",
@@ -1817,14 +2706,16 @@ def cdb_context_impact_handler(**kwargs) -> dict[str, Any]:
     if target_issue is not None and not isinstance(target_issue, str):
         target_issue = None
 
-    valid_modes = frozenset({
-        "read_only",
-        "dry_run",
-        "write (code/docs)",
-        "write (config/infra)",
-        "write (DB/migration)",
-        "write (MCP live)",
-    })
+    valid_modes = frozenset(
+        {
+            "read_only",
+            "dry_run",
+            "write (code/docs)",
+            "write (config/infra)",
+            "write (DB/migration)",
+            "write (MCP live)",
+        }
+    )
     if not isinstance(operation_mode, str) or operation_mode not in valid_modes:
         return {
             "tool": "cdb_context_impact",
@@ -1839,8 +2730,12 @@ def cdb_context_impact_handler(**kwargs) -> dict[str, Any]:
         }
 
     target_paths_clean = [p for p in target_paths if isinstance(p, str) and p.strip()]
-    target_symbols_clean = [s for s in target_symbols if isinstance(s, str) and s.strip()]
-    target_concepts_clean = [c for c in target_concepts if isinstance(c, str) and c.strip()]
+    target_symbols_clean = [
+        s for s in target_symbols if isinstance(s, str) and s.strip()
+    ]
+    target_concepts_clean = [
+        c for c in target_concepts if isinstance(c, str) and c.strip()
+    ]
 
     try:
         inp = ImpactRadarInput(
@@ -1887,7 +2782,9 @@ def cdb_context_evidence_resolve_handler(**kwargs) -> dict[str, Any]:
     Thin adapter: passes **kwargs as the request mapping to the Wave-14 adapter.
     Fail-closed. No DB/network/write.
     """
-    from tools.mcp.context_evidence_memory_tools import handle_cdb_context_evidence_resolve
+    from tools.mcp.context_evidence_memory_tools import (
+        handle_cdb_context_evidence_resolve,
+    )
 
     return handle_cdb_context_evidence_resolve(kwargs)
 
@@ -2094,6 +2991,28 @@ class ContextBridge:
                 handler=context_explain_source_handler,
             )
             self._registry._tools["context.explain_source"] = new_explain
+        old_show_snapshot = self._registry.get_tool("context.show_snapshot")
+        if old_show_snapshot:
+            new_show_snapshot = ToolDefinition(
+                name=old_show_snapshot.name,
+                description=old_show_snapshot.description,
+                input_schema=old_show_snapshot.input_schema,
+                output_schema=old_show_snapshot.output_schema,
+                read_only=old_show_snapshot.read_only,
+                handler=context_show_snapshot_handler,
+            )
+            self._registry._tools["context.show_snapshot"] = new_show_snapshot
+        old_show_audit = self._registry.get_tool("context.show_audit")
+        if old_show_audit:
+            new_show_audit = ToolDefinition(
+                name=old_show_audit.name,
+                description=old_show_audit.description,
+                input_schema=old_show_audit.input_schema,
+                output_schema=old_show_audit.output_schema,
+                read_only=old_show_audit.read_only,
+                handler=context_show_audit_handler,
+            )
+            self._registry._tools["context.show_audit"] = new_show_audit
         old_package = self._registry.get_tool("context.package")
         if old_package:
             new_package = ToolDefinition(
@@ -2388,9 +3307,7 @@ class ContextBridge:
             }
 
         # Input Gate (#2099): scan parameters for forbidden patterns
-        input_violations = PermissionGuard.check_tool_inputs(
-            tool_name, parameters
-        )
+        input_violations = PermissionGuard.check_tool_inputs(tool_name, parameters)
         if input_violations:
             first = input_violations[0]
             return {

@@ -75,6 +75,123 @@ If any capability check fails:
 
 Established by PR #2559 (`a35d7728`). Cross-reference: `cdb-session-start` skill, step 5.
 
+### 1.5.1. Agent MCP Installation Matrix
+
+This matrix defines how every active agent surface accesses the CDB Context MCP.
+Repo presence is not MCP availability. Each surface must be verified independently.
+
+**Five-level distinction:**
+
+| Level | Criterion | How to verify |
+|---|---|---|---|
+| L1 | Config file exists | `claire-de-binare.mcp.json` present in repo root |
+| L2 | Agent host knows config | Host MCP config references `cdb_context` server entry |
+| L3 | MCP server starts | L3a: bridge import (`create_bridge()` works); L3b: stdio server import (`import tools.mcp.server` — bounded, no event loop). If bridge works but stdio is blocked by env, report WARN — bridge-level access is available, host integration needs env fix. |
+| L4 | Tool inventory exposes target | `context.briefing` appears in active MCP tool list |
+| L5 | Actual invocation works | `context.briefing({...})` returns valid response |
+
+**Per-surface status:**
+
+| Agent Surface | L1 Config | L2 Host | L3 Server | L4 Inventory | L5 Invocation | Overall Status |
+|---|---|---|---|---|---|---|---|
+| **Codex** | ✓ verified | via host agent (OpenCode or Claude) | ⚠️ blocked (env: pydantic-core mismatch) | ✓ bridge verified | ✓ bridge verified | reference in agents/templates/codex_mcp_config.md |
+| **OpenCode** | ✓ verified | ✓ host-active verified | ✓ host-active verified | ✓ bridge verified | ✓ bridge verified | repo-tracked config (`opencode.jsonc`) + host-active; cdb_context server connected in OpenCode UI |
+| **Claude / Cloud Code** | ✓ verified | template in `agents/templates/claude_mcp.json.template` | needs host-specific test | needs host-specific test | needs host-specific test | template exists; needs host-specific copy to user-level `.mcp.json` |
+| **Gemini** | ✓ verified | template in `agents/templates/gemini_mcp_config.yml.template` | needs host-specific test | needs host-specific test | needs host-specific test | template exists; needs host-specific embed in workflow YAML |
+| **Onboarding / new agent** | ✓ verified | setup script in `agents/templates/onboarding_mcp_setup.ps1` | ⚠️ blocked (env: pydantic-core mismatch) | ✓ bridge verified | ✓ bridge verified | setup script validates L1/L3/L4/L5; L2 requires manual host config |
+
+**Status key:**
+- `✓ verified` — directly confirmed in this repo session
+- `✓ repo-tracked config` — actual config file tracked in repo, auto-loaded by agent host
+- `✓ host-active verified` — agent host loaded and connected the MCP server (green in host UI)
+- `via host agent` — covered by calling agent's MCP config
+- `template in ...` — tracked template file; requires manual copy/embed
+- `setup script in ...` — executable validation script
+- `⚠️ blocked (env)` — local environment dependency conflict (pydantic-core version); not a code defect
+- `needs host-specific test` — requires the specific agent host to be running with the config registered
+
+**Validation commands (bridge-level, works regardless of MCP SDK):**
+
+```bash
+# Bridge creates successfully — returns tool count
+python -c "from tools.mcp.context_bridge import create_bridge; b=create_bridge(); print(len(b.list_tools()))"
+# Expected: 26
+
+# Key tool present in inventory
+python -c "from tools.mcp.context_bridge import create_bridge; b=create_bridge(); print('context.briefing' in [t['name'] for t in b.list_tools()])"
+# Expected: True
+```
+
+**Validation command (stdio server import — bounded, does not enter event loop):**
+
+```bash
+python -c "import tools.mcp.server; print('STDIO IMPORT OK')"
+# If blocked by pydantic-core version mismatch, fix:
+# pip install 'pydantic>=2.0,<3.0' 'pydantic-core==2.46.4'
+```
+
+> **Note on config naming:** OpenCode's project-level config must be named `opencode.jsonc` or `opencode.json` (no leading dot). The repo tracked config was renamed from `.opencode.jsonc` to `opencode.jsonc` to match this requirement. Pre-existing user-level config at `~/.config/opencode/opencode.jsonc` is loaded alongside and merged per OpenCode's config precedence rules.
+>
+> **Note on server naming:** The repo defines server name `cdb_context`. If a user-level or remote config defines a different server named `cdb`, it is a separate server entry. Both coexist in the OpenCode MCP list. The `cdb` (remote) failure shown in OpenCode is pre-existing and unrelated to the repo baseline — it targets `http://127.0.0.1:8812/mcp` and requires a separate MCP server on that port.
+
+**Repo-tracked configs and templates:**
+
+| Surface | File | Type | Location |
+|---------|------|------|----------|
+| OpenCode | `opencode.jsonc` | repo-tracked config (auto-loaded) | repo root |
+| Claude / Cloud Code | `claude_mcp.json.template` | template (copy to user-level `.mcp.json`) | `agents/templates/` |
+| Gemini | `gemini_mcp_config.yml.template` | template (embed in workflow YAML) | `agents/templates/` |
+| Codex | `codex_mcp_config.md` | reference (no separate MCP surface) | `agents/templates/` |
+| Any surface | `onboarding_mcp_setup.ps1` | validation script (run from repo root) | `agents/templates/` |
+
+Run the onboarding script to validate your setup:
+
+```bash
+pwsh -File agents/templates/onboarding_mcp_setup.ps1
+```
+
+Expected output (best case — bridge + stdio both work):
+```
+=== CDB Context MCP Capability Validation ===
+[L1] Config file exists... PASS
+[L2] Host knows config (manual check)... SKIP (manual)
+[L3] Bridge and stdio server check... PASS
+       Bridge: 26 tools, Stdio import: OK
+[L4] context.briefing in tool inventory... PASS
+[L5] context.briefing invocation... PASS
+=== Results: 4 passed, 0 warnings, 0 failed ===
+CDB Context MCP is available.
+```
+
+Expected output (bridge works, stdio blocked by env):
+```
+=== CDB Context MCP Capability Validation ===
+[L1] Config file exists... PASS
+[L2] Host knows config (manual check)... SKIP (manual)
+[L3] Bridge and stdio server check... BRIDGE OK — STDIO BLOCKED
+       Bridge: 26 tools, Stdio import: BLOCKED
+       STDIO WARN: <error details>
+       This is a local environment blocker (pydantic-core version mismatch),
+       not a #2619 config defect. Bridge-level tool access works.
+       Fix: pip install 'pydantic>=2.0,<3.0' 'pydantic-core==2.46.4'
+[L4] context.briefing in tool inventory... PASS
+[L5] context.briefing invocation... PASS
+=== Results: 4 passed, 1 warnings, 0 failed ===
+CDB Context MCP is available (bridge); warnings above.
+```
+
+**Capability Resolution Rules (all surfaces):**
+
+When scope includes Context, MCP, SurrealDB, ContextBridge, DB-backed Memory, or Evidence:
+
+1. Run MCP Capability Resolution before planning — verify active tool inventory, not config file presence.
+2. If `context.briefing` or required MCP tools are unavailable: stop or explicitly degrade to repo-only.
+3. Do not claim DB-backed Brain/Evidence/Memory unless `surrealdb-local` or equivalent DB-backed source is actually available and usable.
+4. For Wave-14 read-only MCP tools, `metadata.source` must come only from guarded adapter evidence; caller-supplied `source`, `brain_source`, `brain_status`, or nested `metadata.source` values are not DB proof.
+5. Non-DB fallback must not report DB-backed `brain_status="used"`.
+6. Missing MCP access must be reported as `brain_source=unavailable` or explicit `repo-only` / `brain_status=not-used` fallback.
+7. Repo-wide fallback for any surface that cannot verify MCP access: `brain_source=repo-only`, `brain_status=not-used`, repo evidence under `records_or_results`.
+
 ---
 
 ## 2. Non-Goals (Anti-Criteria)
@@ -136,17 +253,17 @@ print(result["status"])  # "ok" or "error"
 |------|--------|-------------|
 | `context.search` | Full | Search the context knowledge base (keyword + structured queries). Returns results with confidence scores and warnings. |
 | `context.trace` | Full | Trace decision or event lineage through the context graph. Returns root node and lineage chain. |
-| `context.explain_source` | Full | Explain provenance of a context source or evidence item. Returns source type, provenance chain, confidence, and stale/tombstone flags. |
+| `context.explain_source` | Full | Resolve provenance for a registered tool or existing repo-relative file path. Repo-/registry-only, deterministic, no DB/network, rejects absolute and traversal paths. |
 | `context.package` | Full | Package context artifacts for handoff between agents or sessions. Capped at 10 items. Includes stop conditions. |
 | `context.readiness` | Full | Assess agent action readiness for a given task scope. Returns one of 6 readiness status values. Requires task_scope and operation_mode. |
 | `context.self_explain` | Full | Generate structured self-explanation for governance-relevant conditions. 9 explanation types supported. |
 | `context.briefing` | Full | Generate structured briefing for agent handoff or session start. Delegates to readiness and package handlers. |
 | `context.stop_resolver` | Full | Map stop condition strings to resolved severity/action. Handles S1–S10 and H1–H5. |
 | `context.required_reads` | Full | Resolve which canonical files an agent must read before starting work. 7-layer resolution. |
-| `context.show_snapshot` | **Stub** | Show a point-in-time snapshot of the context state. Returns `not_implemented` error. |
-| `context.show_audit` | **Stub** | Show audit trail for a specific entity or action. Returns `not_implemented` error. |
+| `context.show_snapshot` | Full | Deterministic registry snapshot (tool inventory + read-only flags). No DB/network/GitHub. |
+| `context.show_audit` | Full | Deterministic registry audit snapshot for a target tool (schema keys + handler wiring status). No DB/network/GitHub. |
 
-All 11 tools are registered as `read_only: true`. The two stub tools return fail-closed errors until future Wave implementation.
+All 11 tools are registered as `read_only: true`. `context.show_snapshot`, `context.show_audit`, and `context.explain_source` are deterministic repo-/registry-only views (no DB-backed trail).
 
 ---
 
@@ -178,7 +295,7 @@ Input scanning uses word-boundary regex and recursive parameter walking (dicts a
 
 ## 7. Tool Usage Examples
 
-All examples use mocked/in-memory responses. For real SurrealDB data, a future Wave will provide a real adapter.
+`context.search` examples below still use mocked/in-memory responses. `context.trace` is read-only and fail-closed, but in the current repo-/in-memory bridge mode it does not invent provenance or lineage. `context.package`, `context.explain_source`, `context.show_snapshot`, and `context.show_audit` are deterministic repo-/registry-only handlers. For real SurrealDB data, a future Wave will provide a real adapter where applicable.
 
 ### 7.1 context.search
 
@@ -227,25 +344,28 @@ Response:
     "tool": "context.trace",
     "status": "ok",
     "trace": {
-        "root": {"id": "evt_001", "type": "unknown", "title": "Mock trace target: evt_001"},
-        "lineage": [
-            {"id": "mock_related_0", "type": "derived", "relationship": "related_to", "depth": 1},
-            {"id": "mock_related_1", "type": "derived", "relationship": "related_to", "depth": 2}
-        ]
+        "root": {"id": "evt_001", "type": "unknown", "title": "Trace target: evt_001"},
+        "lineage": []
     }
 }
 ```
 
-Maximum depth is 20. `depth_exceeded` error returned above 20.
+Maximum depth is 20. `depth_exceeded` error returned above 20. In the current read-only bridge mode, lineage stays empty unless a future evidence-backed resolver is available.
 
 ### 7.3 context.explain_source
 
 ```python
 result = bridge.execute_tool("context.explain_source", {
-    "source_ref": "src_001",
+    "source_ref": "context.readiness",
     "include_chain": True
 })
 ```
+
+Supported refs: exact tool name, `tool:<tool-name>`, repo-relative file path, or
+`path:<repo-relative-path>`. Prefixes are strict: `tool:` only checks the registry,
+`path:` only checks repo files. Unknown refs fail closed with `source_not_found`.
+Absolute paths, Windows drive paths, UNC paths, and `..` traversal fail closed with
+`invalid_source_ref`. File outputs always use repo-relative paths only.
 
 Response:
 ```json
@@ -253,30 +373,45 @@ Response:
     "tool": "context.explain_source",
     "status": "ok",
     "explanation": {
-        "source_ref": "src_001",
-        "source_type": "evidence",
+        "source_ref": "context.readiness",
+        "source_type": "tool",
         "provenance": {
-            "source_path": "/mock/path/src_001",
-            "hash": "mock_hash_123",
-            "commit": "mock_commit_456",
-            "run_id": "mock_run_789",
-            "import_audit_ref": "mock_audit_012",
-            "evidence_refs": ["mock_ev_1", "mock_ev_2"],
+            "tool_name": "context.readiness",
+            "read_only": true,
+            "handler_status": "implemented",
+            "input_schema_keys": [
+                "operation_mode",
+                "required_reads",
+                "stop_conditions",
+                "task_scope"
+            ],
+            "output_schema_keys": [
+                "human_go_required",
+                "reasons",
+                "required_next_reads",
+                "status",
+                "warnings"
+            ],
+            "resolver": "registry",
             "chain": [
-                {"level": 1, "ref": "mock_parent_1", "type": "derived"},
-                {"level": 2, "ref": "mock_parent_2", "type": "source"}
+                {"step": "input_normalized", "source_ref": "context.readiness"},
+                {"step": "registry_checked", "tool_name": "context.readiness", "matched": true},
+                {"step": "resolved", "source_type": "tool", "resolver": "registry"}
             ]
         },
         "source_refs": [
-            {"ref": "mock_audit_012", "type": "import_audit"},
-            {"ref": "mock_ev_1", "type": "evidence"}
+            {"ref": "resolver:registry", "type": "resolver"},
+            {"ref": "tool:context.readiness", "type": "tool"}
         ],
-        "confidence": 0.9,
+        "confidence": 1.0,
         "warnings": [],
         "stale": false,
         "tombstone": false
     },
-    "metadata": {"explained_at": "2026-05-03T12:00:00Z", "include_chain": true}
+    "metadata": {
+        "include_chain": true,
+        "resolution_mode": "repo_registry_only"
+    }
 }
 ```
 
@@ -284,7 +419,10 @@ Response:
 
 ```python
 result = bridge.execute_tool("context.package", {
-    "artifacts": ["art_001", "art_002"],
+    "artifacts": [
+        "context.readiness",
+        "docs/runbooks/surrealdb_context_mcp_access.md"
+    ],
     "format": "json",
     "include_metadata": True
 })
@@ -299,26 +437,57 @@ Response (ok):
         "format": "json",
         "items": [
             {
-                "id": "art_001",
-                "type": "evidence",
-                "summary": "Mock summary for art_001",
-                "source_refs": ["src_art_001_1", "src_art_001_2"],
-                "confidence": 0.85,
-                "freshness": "2026-05-03T00:00:00Z"
+                "id": "context.readiness",
+                "type": "tool",
+                "summary": "Registry tool context.readiness",
+                "source_refs": ["tool:context.readiness"],
+                "confidence": null,
+                "freshness": null,
+                "metadata": {
+                    "read_only": true,
+                    "handler_status": "implemented"
+                }
+            },
+            {
+                "id": "docs/runbooks/surrealdb_context_mcp_access.md",
+                "type": "file",
+                "summary": "Repo file docs/runbooks/surrealdb_context_mcp_access.md",
+                "source_refs": ["path:docs/runbooks/surrealdb_context_mcp_access.md"],
+                "confidence": null,
+                "freshness": null,
+                "metadata": {
+                    "repo_relative_path": "docs/runbooks/surrealdb_context_mcp_access.md"
+                }
             }
         ],
-        "created_at": "2026-05-03T12:00:00Z",
-        "package_id": "pkg_art_001-art_002",
+        "created_at": null,
+        "package_id": "pkg_<deterministic_hash_prefix>",
         "warnings": [],
         "stale_flags": [],
         "missing_context": [],
-        "stop_conditions": ["no_live_go", "no_echtgeld_authorization", "no_risk_approval"],
-        "metadata": {"include_metadata": true, "scope": "default", "truncated": false, "total_requested": 2}
+        "source_refs": [
+            "path:docs/runbooks/surrealdb_context_mcp_access.md",
+            "tool:context.readiness"
+        ],
+        "stop_conditions": [
+            "no_live_go",
+            "no_echtgeld_authorization",
+            "no_risk_approval"
+        ],
+        "metadata": {
+            "include_metadata": true,
+            "scope": "default",
+            "truncated": false,
+            "total_requested": 2,
+            "total_resolved": 2,
+            "total_missing": 0,
+            "resolver": "repo-registry"
+        }
     }
 }
 ```
 
-Artifacts are capped at 10 items (truncation warning added). Empty or missing artifacts returns `invalid_artifacts` error. Package ID is deterministic from sorted artifact IDs.
+Artifacts are capped at 10 items (truncation warning added). Missing/non-list/empty artifacts returns `invalid_artifacts`. The package is repo-/registry-only: it does not read or write SurrealDB, does not create persistent handoff records, and does not imply Live-Go/LR.
 
 ### 7.5 context.readiness
 
@@ -416,7 +585,198 @@ result = bridge.execute_tool("context.briefing", {
 })
 ```
 
-Response includes `briefing_id` (16-char hex, deterministic), `scope_summary`, `required_reads`, `guardrails` (7 mandatory), `stop_conditions`, `validation_plan`, `human_go_required`. Depths: `quick` (summary only), `standard` (with artifacts), `deep` (with mock uncertainty warnings).
+Response includes `briefing_id` (16-char hex, deterministic), `scope_summary`, `required_reads`, `guardrails` (7 mandatory), `stop_conditions`, `validation_plan`, `human_go_required`. Depths: `quick` (summary only), `standard` (with artifacts), `deep` (with mock uncertainty warnings). If `target_issue` is omitted it defaults to `null`; if `requested_depth` is omitted it defaults to `quick`.
+
+`briefing.session_context` is the canonical short-term/session-memory handoff surface for Context/MCP work. It is always `working_memory` with `session_only=true`, remains read-only, and must not be treated as persistent SurrealDB memory. `brain_source` / `brain_status` are derived, not trusted from caller claims:
+
+- `adapter_config_path` (+ `secrets_path` when required by the config) triggers a real Wave-14 trust-summary read through the existing adapter layer. Only `metadata.source="surrealdb-local"` enables DB-backed briefing claims.
+- Inline `evidence_records` / `claim_records` / `decision_events` / `memory_records` derive `brain_source="in_memory"` with `db_claims_allowed=false`.
+- No DB path and no inline records derive `brain_source="repo-only"` and `brain_status="not-used"`.
+- Caller-supplied `brain_source` / `brain_status` are ignored and surfaced only as limitations when present.
+
+### 7.7 Local Wave-14 `surrealdb-local` Proof Smoke
+
+The committed fixture slice for the real local proof lives under:
+
+- `tests/fixtures/surrealdb/wave14_real_smoke/evidence_refs.jsonl`
+- `tests/fixtures/surrealdb/wave14_real_smoke/claims.jsonl`
+- `tests/fixtures/surrealdb/wave14_real_smoke/agent_memories.jsonl`
+- `tests/fixtures/surrealdb/wave14_real_smoke/decision_events.jsonl`
+
+These four files are the only committed seed artifacts. The local-only smoke test
+materializes the remaining importer bundle files as empty temp files at runtime,
+because `tools.surrealdb.context_importer` fail-closes when any expected JSONL
+artifact is missing.
+
+Hard preflight before any real DB-backed Wave-14 claim:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:8010/health
+Invoke-WebRequest http://127.0.0.1:8010/version
+Test-Path infrastructure/config/surrealdb/context_query.local.yaml
+[bool]$env:CDB_CONTEXT_SECRETS_PATH
+[bool]$env:SECRETS_PATH
+```
+
+Fail-closed rules:
+
+- If `/health` or `/version` is not `200`, stop.
+- If `infrastructure/config/surrealdb/context_query.local.yaml` is missing, stop.
+- Resolve secrets dir in this order (never print the path, check existence only):
+  - `CDB_CONTEXT_SECRETS_PATH` if set (override)
+  - `SECRETS_PATH` if set (canon)
+  - Windows default: `%USERPROFILE%\Documents\.secrets\.cdb` (canon)
+  - Linux/Mac default: `$HOME/Documents/.secrets/.cdb` (canon)
+- If no secrets dir resolves, or if `SURREALDB_ENV` is missing inside it, stop.
+- If only `context_query.local.example.yaml` exists, status stays `BLOCKED_NEEDS_AUTH_CONFIG`.
+- Never print secret file contents. The smoke only checks the config path and the
+  presence of env flags and required secret file existence.
+
+Opt-in execution:
+
+```powershell
+$env:CDB_RUN_REAL_SURREALDB_SMOKE = "1"
+pytest -v tests/unit/tools/mcp/test_mcp_wave14_surrealdb_mode.py
+pytest -v tests/unit/tools/mcp/test_context_bridge.py
+pytest -v -m local_only tests/local/tools/mcp/test_wave14_real_surrealdb_smoke.py
+```
+
+What the local smoke does:
+
+1. Re-checks the same preflight gates and skips fail-closed if they are missing.
+2. Builds a temporary full JSONL bundle from the four committed Wave-14 seed files.
+3. Applies that bundle to the local Context DB through the existing importer using:
+   - `--adapter surrealdb-local`
+   - `--apply --apply-mode local-dev`
+   - `--config infrastructure/config/surrealdb/context_import.local.example.yaml`
+   - explicit `--secrets-path`
+4. Calls all six Wave-14 MCP handlers with:
+   - `adapter_config_path=infrastructure/config/surrealdb/context_query.local.yaml`
+   - `secrets_path=<resolved secrets dir>` (see resolution order above; `CDB_CONTEXT_SECRETS_PATH` is an override, not a new default)
+5. Asserts for each tool:
+   - `status == "ok"`
+   - `metadata.source == "surrealdb-local"`
+   - `metadata.read_only == true`
+   - expected result payload is non-empty
+   - no secret-like auth values are echoed back
+
+Tool coverage in the real local smoke:
+
+- `cdb_context_memory_get` → seeded `agent_memory`
+- `cdb_context_evidence_resolve` → seeded `evidence_ref`
+- `cdb_context_claim_resolve` → seeded `claim`
+- `cdb_context_trust_summary` → seeded `evidence_ref` + `claim` + `agent_memory` + `decision_event`
+- `cdb_context_decision_history` → seeded `decision_event`
+- `cdb_context_decision_replay` → seeded `decision_event`
+
+Deterministic repo-only example with explicit session state inputs:
+
+```python
+result = bridge.execute_tool("context.briefing", {
+    "task_id": "task_review_2607",
+    "target_issue": "#2607",
+    "task_scope": "review session-context handoff behavior",
+    "requested_depth": "quick",
+    "operation_mode": "read_only",
+    "repo_state": {
+        "branch": "fix/2613-noise-freeze-remaining-push-triggers",
+        "commit": "f345cf0c",
+        "working_tree": "dirty"
+    },
+    "github_state": {
+        "target_issue": "#2607",
+        "related_prs": [],
+        "open_epics": ["#2607"]
+    },
+    "working_assumptions": [
+        "repo-only verification is sufficient for this handoff"
+    ]
+})
+```
+
+Expected abbreviated output:
+
+```json
+{
+  "tool": "context.briefing",
+  "status": "ok",
+  "briefing": {
+    "session_context": {
+      "memory_type": "working_memory",
+      "session_only": true,
+      "ttl_seconds": 14400,
+      "brain_source": "repo-only",
+      "brain_status": "not-used",
+      "repo_state": {
+        "branch": "fix/2613-noise-freeze-remaining-push-triggers",
+        "commit": "f345cf0c",
+        "working_tree": "dirty"
+      },
+      "github_state": {
+        "target_issue": "#2607",
+        "related_prs": [],
+        "open_epics": ["#2607"]
+      },
+      "agent_operating_mode": {
+        "operation_mode": "read_only",
+        "human_go_required": false,
+        "db_claims_allowed": false
+      },
+      "working_assumptions": [
+        "repo-only verification is sufficient for this handoff"
+      ]
+    }
+  }
+}
+```
+
+Brain Evidence mapping from `briefing.session_context`:
+
+- `brain_source <- briefing.session_context.brain_source`
+- `brain_status <- briefing.session_context.brain_status`
+- `tools_or_queries <- caller-provided MCP/tool reads or, if absent, conservative session limitations`
+- `records_or_results <- briefing.session_context.repo_state + briefing.session_context.github_state`
+- `repo_crosscheck <- briefing.session_context.repo_state + briefing.required_reads + request target paths/symbols when present`
+- `impact_on_plan <- briefing.session_context.working_assumptions + briefing.session_context.limitations`
+- `limitations <- briefing.session_context.limitations`
+
+Canonical Brain Evidence block derived from the example above:
+
+```text
+## Brain Evidence
+brain_source: repo-only
+brain_status: not-used
+tools_or_queries:
+  - context.briefing(task_review_2607)
+  - repo-only verification is sufficient for this handoff
+records_or_results:
+  - branch=fix/2613-noise-freeze-remaining-push-triggers
+  - commit=f345cf0c
+  - working_tree=dirty
+  - target_issue=#2607
+  - related_prs=[]
+  - open_epics=[#2607]
+repo_crosscheck:
+  - briefing.required_reads
+  - branch=fix/2613-noise-freeze-remaining-push-triggers
+  - commit=f345cf0c
+impact_on_plan:
+  - repo-only verification is sufficient for this handoff
+  - repo-only brain source; no DB-backed memory or evidence claims
+limitations:
+  - repo-only brain source; no DB-backed memory or evidence claims
+```
+
+### #2607 Short-Term Session Context Acceptance
+
+- Structured `session_context` preserves `branch`, `commit`, and `working_tree` when caller-provided.
+- Issue/PR state can be handed off through `github_state` (`target_issue`, `related_prs`, `open_epics`).
+- `working_assumptions` are temporary session hints only because `session_only=true`.
+- `ttl_seconds` is bounded to `<= 14400` (4h) for this MCP handoff surface.
+- `repo-only` and `in_memory` are not DB-backed and must keep `db_claims_allowed=false`.
+- Persistent Brain or memory claims require a real adapter-backed read that returns `metadata.source="surrealdb-local"`; briefing fails closed when DB-backed mode is requested but config/auth/adapter source cannot prove that path.
+- `session_context` does not authorize any automatic long-term memory write or persistent DB write.
+- A full Brain Evidence block can be generated from `briefing.session_context` plus the sibling briefing fields such as `required_reads`.
 
 ### 7.7 context.stop_resolver
 
@@ -521,7 +881,7 @@ Even when `status: ready_for_human_go`, the agent MUST stop and wait for explici
 | Symptom | Error Code | Cause | Action |
 |---------|------------|-------|--------|
 | `"unknown_tool"` | `unknown_tool` | Tool name not in registry | Check spelling. Use `bridge.list_tool_names()`. |
-| `"not_implemented"` | `not_implemented` | Tool is a stub (show_snapshot, show_audit) | These tools are not yet implemented. Use the CLI or wait for future Wave. |
+| `"not_implemented"` | `not_implemented` | Tool handler scaffold placeholder | The target tool is still wired to a scaffold handler. Use `context.show_audit` to audit `handler_status` and confirm wiring, then stop and report which tool remains stubbed. |
 | `"invalid_query"` | `invalid_query` | Missing, empty, or non-string query | Provide a non-empty string in the `query` field. |
 | `"invalid_artifacts"` | `invalid_artifacts` | Missing or non-list artifacts | Provide a non-empty list of artifact ID strings. |
 | `"invalid_parameters"` | `invalid_parameters` | Parameters not a dict | Pass parameters as `dict`, not list/string/int. |

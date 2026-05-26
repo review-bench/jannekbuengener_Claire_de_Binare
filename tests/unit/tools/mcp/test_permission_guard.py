@@ -23,10 +23,15 @@ from tools.mcp.permission_guard import (
     FORBIDDEN_SQL_KEYWORDS,
     INPUT_SCAN_EXEMPT_TOOLS,
     INPUT_SCAN_TOOLS,
+    PARAMETER_SCAN_EXEMPTIONS,
     PermissionCheckResult,
     PermissionGuard,
 )
-from tools.mcp.registry import ContextToolRegistry, ToolDefinition
+from tools.mcp.registry import (
+    ContextToolRegistry,
+    ToolDefinition,
+    create_not_implemented_handler,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -115,19 +120,27 @@ class TestExecuteGate:
 
     def test_execute_not_implemented_tool_returns_error(self) -> None:
         """Stub tool returns not_implemented error."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.show_snapshot", {"snapshot_id": "test"}
+        name = "__test_stub_not_implemented__"
+        ContextToolRegistry._tools[name] = ToolDefinition(
+            name=name,
+            description="Temporary stub tool for permission guard tests",
+            input_schema={"type": "object", "properties": {}},
+            output_schema={"type": "object", "properties": {}},
+            read_only=True,
+            handler=create_not_implemented_handler(name),
         )
-        assert result["status"] == "error"
-        assert result["error"]["code"] == "not_implemented"
+        try:
+            bridge = create_bridge()
+            result = bridge.execute_tool(name, {})
+            assert result["status"] == "error"
+            assert result["error"]["code"] == "not_implemented"
+        finally:
+            del ContextToolRegistry._tools[name]
 
     def test_execute_search_with_forbidden_keyword_blocked(self) -> None:
         """context.search with INSERT in query is blocked by input gate."""
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.search", {"query": "INSERT INTO table_x"}
-        )
+        result = bridge.execute_tool("context.search", {"query": "INSERT INTO table_x"})
         assert result["status"] == "error"
         assert result["error"]["code"] in (
             "forbidden_keyword",
@@ -168,9 +181,7 @@ class TestExecuteGate:
     def test_execute_search_with_deploy_keyword_blocked(self) -> None:
         """context.search with 'deploy' in query is blocked (query tool)."""
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.search", {"query": "deploy the service"}
-        )
+        result = bridge.execute_tool("context.search", {"query": "deploy the service"})
         assert result["status"] == "error"
         assert result["error"]["code"] == "forbidden_runtime_operation"
 
@@ -219,6 +230,30 @@ class TestExecuteGate:
         )
         assert result["status"] == "ok"
 
+    def test_execute_show_audit_with_keyword_tool_name_reaches_handler(self) -> None:
+        """show_audit lets target_tool identifiers reach the handler."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.show_audit", {"target_tool": "context.create"}
+        )
+        assert result["status"] == "ok"
+        assert result["audit"]["target_tool"] == "context.create"
+        assert result["audit"]["exists"] is False
+        assert result["audit"]["handler_status"] == "unknown_tool"
+
+    def test_execute_show_audit_entity_id_alias_with_keyword_reaches_handler(
+        self,
+    ) -> None:
+        """show_audit preserves entity_id alias compatibility for tool names."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.show_audit", {"entity_id": "context.update"}
+        )
+        assert result["status"] == "ok"
+        assert result["audit"]["target_tool"] == "context.update"
+        assert result["audit"]["exists"] is False
+        assert result["audit"]["handler_status"] == "unknown_tool"
+
 
 # ---------------------------------------------------------------------------
 # 3. Input Gate — Tool Classification
@@ -243,6 +278,13 @@ class TestInputGateToolClassification:
         assert "context.self_explain" in INPUT_SCAN_EXEMPT_TOOLS
         assert "context.stop_resolver" in INPUT_SCAN_EXEMPT_TOOLS
         assert "context.required_reads" in INPUT_SCAN_EXEMPT_TOOLS
+
+    def test_show_audit_identifier_fields_are_parameter_exempt(self) -> None:
+        """show_audit skips scanning only the tool identifier fields."""
+        assert PARAMETER_SCAN_EXEMPTIONS["context.show_audit"] == {
+            "target_tool",
+            "entity_id",
+        }
 
     def test_scan_and_exempt_are_disjoint(self) -> None:
         """No tool is in both INPUT_SCAN_TOOLS and INPUT_SCAN_EXEMPT_TOOLS."""
@@ -285,6 +327,14 @@ class TestInputGateToolClassification:
         )
         assert len(results) >= 1
 
+    def test_show_audit_non_identifier_field_still_scanned(self) -> None:
+        """show_audit keeps mutation scanning for non-identifier string fields."""
+        results = PermissionGuard.check_tool_inputs(
+            "context.show_audit",
+            {"audit_type": "CREATE"},
+        )
+        assert any(r.code == "forbidden_keyword" for r in results)
+
 
 _WAVE14_EXEMPT_TOOLS = [
     "cdb_context_evidence_resolve",
@@ -320,7 +370,10 @@ class TestInputGateWave14Exemption:
                 "evidence_records": [
                     {"evidence_id": "ev-1", "title": "Create migration evidence"},
                     {"evidence_id": "ev-2", "title": "Update runbook decision"},
-                    {"evidence_id": "ev-3", "title": "Delete branch warning in historical note"},
+                    {
+                        "evidence_id": "ev-3",
+                        "title": "Delete branch warning in historical note",
+                    },
                 ]
             },
         )
@@ -382,7 +435,12 @@ class TestInputGateForbiddenKeywords:
         """Keywords in nested dict parameters are detected in query tools."""
         results = PermissionGuard.check_tool_inputs(
             "context.search",
-            {"filters": {"source_types": ["decision"], "date_from": "DELETE FROM logs"}},
+            {
+                "filters": {
+                    "source_types": ["decision"],
+                    "date_from": "DELETE FROM logs",
+                }
+            },
         )
         assert len(results) >= 1
         assert results[0].code == "forbidden_keyword"
@@ -547,9 +605,7 @@ class TestToolDefinitionCheck:
     """check_tool_definition rejects non-read-only tools."""
 
     def test_read_only_tool_passes(self) -> None:
-        result = PermissionGuard.check_tool_definition(
-            "context.search", read_only=True
-        )
+        result = PermissionGuard.check_tool_definition("context.search", read_only=True)
         assert result is None
 
     def test_non_read_only_tool_blocked(self) -> None:
@@ -571,9 +627,7 @@ class TestRegistryConsistencyCheck:
     """check_registry_consistency detects non-read-only tools in the registry."""
 
     def test_all_read_only_registry_passes(self) -> None:
-        result = PermissionGuard.check_registry_consistency(
-            ContextToolRegistry._tools
-        )
+        result = PermissionGuard.check_registry_consistency(ContextToolRegistry._tools)
         assert result is None
 
     def test_registry_with_write_tool_fails(self) -> None:
@@ -646,11 +700,9 @@ class TestAllCurrentToolsPassInputGate:
         )
         assert result["status"] == "ok"
 
-    def test_context_explain_source_normal_passes(
-        self, bridge: ContextBridge
-    ) -> None:
+    def test_context_explain_source_normal_passes(self, bridge: ContextBridge) -> None:
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_001"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         assert result["status"] == "ok"
 
@@ -679,9 +731,7 @@ class TestAllCurrentToolsPassInputGate:
         )
         assert result["status"] == "ok"
 
-    def test_context_self_explain_normal_passes(
-        self, bridge: ContextBridge
-    ) -> None:
+    def test_context_self_explain_normal_passes(self, bridge: ContextBridge) -> None:
         result = bridge.execute_tool(
             "context.self_explain",
             {
@@ -740,9 +790,7 @@ class TestErrorCodesAreAgentReadable:
         assert result["status"] == "error"
         error = result["error"]
         assert error["code"] == "forbidden_runtime_operation"
-        assert "git_commit" in error["message"] or "git_commit" in str(
-            error["details"]
-        )
+        assert "git_commit" in error["message"] or "git_commit" in str(error["details"])
 
     def test_non_read_only_error_structure(self) -> None:
         result = PermissionGuard.check_tool_definition(
@@ -751,7 +799,10 @@ class TestErrorCodesAreAgentReadable:
         assert result is not None
         assert result.code == "non_read_only_tool"
         assert "context.bad_tool" in result.message
-        assert "read-only" in result.message.lower() or "not read-only" in result.message.lower()
+        assert (
+            "read-only" in result.message.lower()
+            or "not read-only" in result.message.lower()
+        )
 
     def test_registry_inconsistency_error_structure(self) -> None:
         result = PermissionGuard.check_registry_consistency(
@@ -852,9 +903,7 @@ class TestAllowedReadOnlyInputsPass:
     )
     def test_read_only_queries_pass(self, query: str) -> None:
         """Common read-only queries produce no violations in search tool."""
-        results = PermissionGuard.check_tool_inputs(
-            "context.search", {"query": query}
-        )
+        results = PermissionGuard.check_tool_inputs("context.search", {"query": query})
         violations = [
             r
             for r in results
@@ -876,15 +925,10 @@ class TestAllowedReadOnlyInputsPass:
         results = PermissionGuard.check_tool_inputs(
             "context.search", {"query": "SELECT * FROM decisions WHERE id=1"}
         )
-        keyword_violations = [
-            r for r in results if r.code == "forbidden_keyword"
-        ]
-        pattern_violations = [
-            r for r in results if r.code == "forbidden_query_pattern"
-        ]
+        keyword_violations = [r for r in results if r.code == "forbidden_keyword"]
+        pattern_violations = [r for r in results if r.code == "forbidden_query_pattern"]
         assert len(keyword_violations) == 0, (
-            f"SELECT should not trigger forbidden_keyword: "
-            f"{keyword_violations}"
+            f"SELECT should not trigger forbidden_keyword: " f"{keyword_violations}"
         )
         assert len(pattern_violations) == 0, (
             f"SELECT should not trigger forbidden_query_pattern: "
@@ -897,9 +941,7 @@ class TestAllowedReadOnlyInputsPass:
             "context.readiness",
             {"operation_mode": "read_only"},
         )
-        violations = [
-            r for r in results if r.code == "forbidden_runtime_operation"
-        ]
+        violations = [r for r in results if r.code == "forbidden_runtime_operation"]
         assert len(violations) == 0
 
     def test_dry_run_operation_mode_not_flagged(self) -> None:
@@ -945,9 +987,7 @@ class TestBridgeIntegrationInputGate:
 
     def test_bridge_blocks_insert_query(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.search", {"query": "INSERT INTO context"}
-        )
+        result = bridge.execute_tool("context.search", {"query": "INSERT INTO context"})
         assert result["status"] == "error"
         assert result["error"]["code"] in (
             "forbidden_keyword",
@@ -956,9 +996,7 @@ class TestBridgeIntegrationInputGate:
 
     def test_bridge_blocks_delete_query(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.search", {"query": "DELETE FROM context"}
-        )
+        result = bridge.execute_tool("context.search", {"query": "DELETE FROM context"})
         assert result["status"] == "error"
         assert result["error"]["code"] in (
             "forbidden_keyword",
@@ -984,9 +1022,7 @@ class TestBridgeIntegrationInputGate:
     def test_bridge_blocks_deploy_in_search(self) -> None:
         """Deploy in search query is blocked (query tool)."""
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.search", {"query": "deploy the service"}
-        )
+        result = bridge.execute_tool("context.search", {"query": "deploy the service"})
         assert result["status"] == "error"
         assert result["error"]["code"] == "forbidden_runtime_operation"
 
@@ -1013,16 +1049,12 @@ class TestBridgeIntegrationInputGate:
 
     def test_bridge_allows_normal_trace(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.trace", {"target_id": "evt_abc123"}
-        )
+        result = bridge.execute_tool("context.trace", {"target_id": "evt_abc123"})
         assert result["status"] == "ok"
 
     def test_bridge_allows_normal_search(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.search", {"query": "risk decisions"}
-        )
+        result = bridge.execute_tool("context.search", {"query": "risk decisions"})
         assert result["status"] == "ok"
 
     def test_bridge_error_includes_all_violations(self) -> None:
@@ -1057,6 +1089,7 @@ class TestNoneParametersRegression:
         assert result["status"] == "error"
         assert result["error"]["code"] in (
             "not_implemented",
+            "invalid_snapshot_id",
             "invalid_query",
             "target_not_found",
             "invalid_source_ref",

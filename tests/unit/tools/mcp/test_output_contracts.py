@@ -60,31 +60,24 @@ class TestTraceOutputContract:
 
     def test_ok_output_has_tool_and_status(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.trace", {"target_id": "evt_001"}
-        )
+        result = bridge.execute_tool("context.trace", {"target_id": "evt_001"})
         assert result["tool"] == "context.trace"
         assert result["status"] == "ok"
 
     def test_trace_has_root_with_id_type_title(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.trace", {"target_id": "evt_001"}
-        )
+        result = bridge.execute_tool("context.trace", {"target_id": "evt_001"})
         root = result["trace"]["root"]
-        assert "id" in root
-        assert "type" in root
-        assert "title" in root
+        assert root["id"] == "evt_001"
+        assert root["type"] == "unknown"
+        assert root["title"] == "Trace target: evt_001"
 
-    def test_trace_has_lineage_with_relationship(self) -> None:
+    def test_trace_lineage_empty_without_evidence(self) -> None:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.trace", {"target_id": "evt_001", "depth": 3}
         )
-        for item in result["trace"]["lineage"]:
-            assert "id" in item
-            assert "relationship" in item
-            assert "depth" in item
+        assert result["trace"]["lineage"] == []
 
     def test_error_output_has_target_not_found_code(self) -> None:
         bridge = create_bridge()
@@ -99,7 +92,7 @@ class TestExplainSourceOutputContract:
     def test_ok_output_has_tool_and_status(self) -> None:
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_001"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         assert result["tool"] == "context.explain_source"
         assert result["status"] == "ok"
@@ -107,7 +100,7 @@ class TestExplainSourceOutputContract:
     def test_explanation_has_source_ref_type_provenance(self) -> None:
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_001"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         expl = result["explanation"]
         assert "source_ref" in expl
@@ -117,7 +110,7 @@ class TestExplainSourceOutputContract:
     def test_explanation_has_confidence_warnings_stale_tombstone(self) -> None:
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_001"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         expl = result["explanation"]
         assert "confidence" in expl
@@ -128,7 +121,7 @@ class TestExplainSourceOutputContract:
     def test_source_refs_is_list(self) -> None:
         bridge = create_bridge()
         result = bridge.execute_tool(
-            "context.explain_source", {"source_ref": "src_001"}
+            "context.explain_source", {"source_ref": "context.readiness"}
         )
         assert isinstance(result["explanation"]["source_refs"], list)
 
@@ -136,10 +129,43 @@ class TestExplainSourceOutputContract:
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.explain_source",
-            {"source_ref": "src_001", "include_chain": False},
+            {"source_ref": "context.readiness", "include_chain": False},
         )
         provenance = result["explanation"]["provenance"]
         assert "chain" not in provenance
+
+    def test_file_source_uses_repo_relative_path_and_not_mock_values(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {"source_ref": "docs/runbooks/surrealdb_context_mcp_access.md"},
+        )
+        expl = result["explanation"]
+        assert expl["source_type"] == "file"
+        assert (
+            expl["provenance"]["repo_relative_path"]
+            == "docs/runbooks/surrealdb_context_mcp_access.md"
+        )
+        assert "mock" not in str(expl).lower()
+
+    def test_source_refs_are_sorted_and_stable(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source", {"source_ref": "context.readiness"}
+        )
+        refs = result["explanation"]["source_refs"]
+        assert refs == sorted(refs, key=lambda item: (item["ref"], item["type"]))
+
+    def test_chain_omitted_when_include_chain_false(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.explain_source",
+            {
+                "source_ref": "docs/runbooks/surrealdb_context_mcp_access.md",
+                "include_chain": False,
+            },
+        )
+        assert "chain" not in result["explanation"]["provenance"]
 
 
 class TestPackageOutputContract:
@@ -147,9 +173,7 @@ class TestPackageOutputContract:
 
     def test_ok_output_has_package_with_format_items_created_at(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.package", {"artifacts": ["art_001"]}
-        )
+        result = bridge.execute_tool("context.package", {"artifacts": ["art_001"]})
         pkg = result["package"]
         assert "format" in pkg
         assert "items" in pkg
@@ -158,9 +182,7 @@ class TestPackageOutputContract:
 
     def test_package_id_is_string(self) -> None:
         bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.package", {"artifacts": ["art_001"]}
-        )
+        result = bridge.execute_tool("context.package", {"artifacts": ["art_001"]})
         assert isinstance(result["package"]["package_id"], str)
 
     def test_error_output_has_invalid_artifacts_code(self) -> None:
@@ -252,7 +274,11 @@ class TestReadinessOutputContract:
             },
         )
         guardrails_text = " ".join(result["readiness"]["guardrails"])
-        assert "NO-GO" in guardrails_text or "No-Go" in guardrails_text or "no_go" in guardrails_text.lower()
+        assert (
+            "NO-GO" in guardrails_text
+            or "No-Go" in guardrails_text
+            or "no_go" in guardrails_text.lower()
+        )
 
 
 class TestBriefingOutputContract:
@@ -338,3 +364,127 @@ class TestCdbContextBriefingAliasOutputContract:
         assert "guardrails" in result["briefing"]
         assert isinstance(result["briefing"]["guardrails"], list)
         assert len(result["briefing"]["guardrails"]) > 0
+
+
+class TestShowSnapshotOutputContract:
+    """Verify context.show_snapshot output matches contract structure."""
+
+    def test_ok_output_has_tool_and_status(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.show_snapshot", {"snapshot_id": "snap_contract_001"}
+        )
+        assert result["tool"] == "context.show_snapshot"
+        assert result["status"] == "ok"
+
+    def test_snapshot_has_required_fields(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.show_snapshot", {"snapshot_id": "snap_contract_001"}
+        )
+        snap = result["snapshot"]
+        assert snap["snapshot_id"] == "snap_contract_001"
+        assert isinstance(snap["tools_count"], int)
+        assert isinstance(snap["tool_names"], list)
+        assert "context.show_snapshot" in snap["tool_names"]
+
+    def test_invalid_snapshot_id_fails_closed(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool("context.show_snapshot", {})
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "invalid_snapshot_id"
+
+
+class TestShowAuditOutputContract:
+    """Verify context.show_audit output matches contract structure."""
+
+    def test_ok_output_has_tool_and_status(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.show_audit", {"entity_id": "context.show_snapshot"}
+        )
+        assert result["tool"] == "context.show_audit"
+        assert result["status"] == "ok"
+
+    def test_audit_has_required_fields(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.show_audit", {"entity_id": "context.show_snapshot"}
+        )
+        audit = result["audit"]
+        for field in (
+            "audit_id",
+            "target_tool",
+            "audit_type",
+            "limit",
+            "exists",
+            "read_only",
+            "handler_status",
+            "input_schema_keys",
+            "output_schema_keys",
+            "guard",
+            "source",
+            "limitations",
+        ):
+            assert field in audit, f"Missing field: {field}"
+        assert audit["target_tool"] == "context.show_snapshot"
+        assert isinstance(audit["audit_id"], str)
+        assert isinstance(audit["audit_type"], str)
+        assert isinstance(audit["limit"], int)
+        assert isinstance(audit["exists"], bool)
+        assert isinstance(audit["read_only"], bool)
+        assert isinstance(audit["input_schema_keys"], list)
+        assert isinstance(audit["output_schema_keys"], list)
+        assert isinstance(audit["guard"], dict)
+        assert audit["source"] == "registry"
+
+    def test_audit_id_is_deterministic_for_identical_inputs(self) -> None:
+        bridge = create_bridge()
+        params = {
+            "target_tool": "context.show_snapshot",
+            "audit_type": "all",
+            "limit": 50,
+        }
+        r1 = bridge.execute_tool("context.show_audit", params)
+        r2 = bridge.execute_tool("context.show_audit", params)
+        assert r1["audit"]["audit_id"] == r2["audit"]["audit_id"]
+
+    def test_audit_id_changes_when_target_tool_changes(self) -> None:
+        bridge = create_bridge()
+        r1 = bridge.execute_tool(
+            "context.show_audit", {"target_tool": "context.show_snapshot"}
+        )
+        r2 = bridge.execute_tool(
+            "context.show_audit", {"target_tool": "context.search"}
+        )
+        assert r1["audit"]["audit_id"] != r2["audit"]["audit_id"]
+
+    def test_audit_id_changes_when_audit_type_changes(self) -> None:
+        bridge = create_bridge()
+        r1 = bridge.execute_tool(
+            "context.show_audit",
+            {"target_tool": "context.show_snapshot", "audit_type": "all"},
+        )
+        r2 = bridge.execute_tool(
+            "context.show_audit",
+            {"target_tool": "context.show_snapshot", "audit_type": "handler"},
+        )
+        assert r1["audit"]["audit_id"] != r2["audit"]["audit_id"]
+
+    def test_audit_id_changes_when_limit_changes(self) -> None:
+        bridge = create_bridge()
+        r1 = bridge.execute_tool(
+            "context.show_audit",
+            {"target_tool": "context.show_snapshot", "limit": 1},
+        )
+        r2 = bridge.execute_tool(
+            "context.show_audit",
+            {"target_tool": "context.show_snapshot", "limit": 2},
+        )
+        assert r1["audit"]["audit_id"] != r2["audit"]["audit_id"]
+
+    def test_invalid_entity_id_fails_closed(self) -> None:
+        bridge = create_bridge()
+        result = bridge.execute_tool("context.show_audit", {})
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "invalid_entity_id"
