@@ -5,6 +5,7 @@ Tests the scaffold structure without requiring live SurrealDB or network.
 """
 
 from pathlib import Path
+from typing import Any
 import pytest
 from tools.mcp.context_bridge import ContextBridge, create_bridge
 from tools.mcp.registry import ContextToolRegistry
@@ -112,7 +113,7 @@ class TestContextTraceHandler:
         assert result["error"]["code"] == "target_not_found"
 
     def test_valid_target_id_returns_ok(self) -> None:
-        """Valid target_id returns ok status with trace (mocked)."""
+        """Valid target_id returns ok status with trace payload."""
         bridge = create_bridge()
         result = bridge.execute_tool("context.trace", {"target_id": "evt_abc123"})
         assert result["status"] == "ok"
@@ -120,15 +121,16 @@ class TestContextTraceHandler:
         assert "trace" in result
         assert "root" in result["trace"]
         assert "lineage" in result["trace"]
+        assert result["trace"]["lineage"] == []
 
     def test_depth_parameter_accepted(self) -> None:
-        """Depth parameter is accepted and respected."""
+        """Depth parameter is accepted without inventing lineage."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.trace", {"target_id": "evt_abc123", "depth": 10}
         )
         assert result["status"] == "ok"
-        assert len(result["trace"]["lineage"]) <= 10
+        assert result["trace"]["lineage"] == []
 
     def test_depth_exceeds_max_returns_error(self) -> None:
         """Depth exceeding 20 returns error."""
@@ -145,6 +147,13 @@ class TestContextTraceHandler:
         result = bridge.execute_tool("context.trace", {"target_id": "evt_test"})
         assert result["status"] == "ok"
         assert result["trace"]["root"]["id"] == "evt_test"
+
+    def test_trace_root_title_is_neutral(self) -> None:
+        """Trace root title must not claim mock provenance."""
+        bridge = create_bridge()
+        result = bridge.execute_tool("context.trace", {"target_id": "evt_test"})
+        assert result["status"] == "ok"
+        assert result["trace"]["root"]["title"] == "Trace target: evt_test"
 
 
 class TestContextExplainSourceHandler:
@@ -1486,22 +1495,22 @@ class TestContextBriefingHandler:
         assert session_context["github_state"]["related_prs"] == []
         assert session_context["github_state"]["open_epics"] == []
 
-    def test_repo_only_brain_source_disables_db_claims(self) -> None:
-        """repo-only brain source forbids DB-backed claims."""
+    def test_default_brain_context_is_repo_only(self) -> None:
+        """Without DB or inline records, briefing stays repo-only and non-DB-backed."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
             {
-                "task_id": "cdb-briefing-repo-only",
-                "task_scope": "Validate repo-only brain source handling.",
+                "task_id": "cdb-briefing-default-brain-context",
+                "task_scope": "Validate repo-only derived brain context.",
                 "target_issue": "#2607",
                 "requested_depth": "quick",
                 "operation_mode": "read_only",
-                "brain_source": "repo-only",
             },
         )
         session_context = result["briefing"]["session_context"]
         assert session_context["brain_source"] == "repo-only"
+        assert session_context["brain_status"] == "not-used"
         assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
 
     def test_repo_only_session_context_matches_brain_evidence_gate_defaults(
@@ -1517,7 +1526,6 @@ class TestContextBriefingHandler:
                 "target_issue": "#2607",
                 "requested_depth": "quick",
                 "operation_mode": "read_only",
-                "brain_source": "repo-only",
             },
         )
         session_context = result["briefing"]["session_context"]
@@ -1528,19 +1536,20 @@ class TestContextBriefingHandler:
             for item in session_context["limitations"]
         )
 
-    def test_in_memory_brain_source_still_disables_db_claims(self) -> None:
-        """Non-SurrealDB brain sources do not permit DB-backed claims."""
+    def test_inline_records_derive_in_memory_brain_source(self) -> None:
+        """Inline enrichment records derive in-memory brain context without DB claims."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
             {
-                "task_id": "cdb-briefing-in-memory-brain",
-                "task_scope": "Validate in-memory Brain Evidence compatibility.",
+                "task_id": "cdb-briefing-inline-in-memory",
+                "task_scope": "Validate in-memory derived Brain Evidence compatibility.",
                 "target_issue": None,
                 "requested_depth": "quick",
                 "operation_mode": "read_only",
-                "brain_source": "in_memory",
-                "brain_status": "used",
+                "memory_records": [
+                    {"memory_id": "mem-001", "scope": "wave14", "content": "test"}
+                ],
             },
         )
         session_context = result["briefing"]["session_context"]
@@ -1548,159 +1557,131 @@ class TestContextBriefingHandler:
         assert session_context["brain_status"] == "used"
         assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
 
-    def test_surrealdb_local_used_allows_db_claims(self) -> None:
-        """surrealdb-local with used status enables DB-backed claim mode."""
+    def test_db_requested_briefing_uses_surrealdb_local_metadata(
+        self, monkeypatch
+    ) -> None:
+        """DB-backed briefing claims require real adapter metadata, not caller input."""
+        monkeypatch.setattr(
+            "tools.mcp.context_evidence_memory_tools.handle_cdb_context_trust_summary",
+            lambda request: {
+                "tool": "cdb_context_trust_summary",
+                "status": "ok",
+                "result": {"scope": request["parameters"]["scope"]},
+                "metadata": {
+                    "query_time_ms": 0,
+                    "source": "surrealdb-local",
+                    "read_only": True,
+                },
+            },
+        )
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
             {
-                "task_id": "cdb-briefing-surrealdb-local",
-                "task_scope": "Validate surrealdb-local claim mode.",
+                "task_id": "cdb-briefing-surrealdb-derived",
+                "task_scope": "Validate surrealdb-local derived claim mode.",
                 "target_issue": "#2607",
                 "requested_depth": "quick",
                 "operation_mode": "read_only",
-                "brain_source": "surrealdb-local",
-                "brain_status": "used",
+                "adapter_config_path": "infrastructure/config/surrealdb/context_query.local.example.yaml",
+                "secrets_path": "D:/tmp/fake-secrets",
             },
         )
+        assert result["status"] == "ok"
         session_context = result["briefing"]["session_context"]
         assert session_context["brain_source"] == "surrealdb-local"
+        assert session_context["brain_status"] == "used"
         assert session_context["agent_operating_mode"]["db_claims_allowed"] is True
 
-    def test_surrealdb_local_partial_allows_db_claims(self) -> None:
-        """surrealdb-local with partial status still enables DB-backed claims."""
+    def test_db_requested_briefing_propagates_adapter_config_error(
+        self, monkeypatch
+    ) -> None:
+        """Config/auth failures on the DB-backed path fail closed on briefing."""
+        monkeypatch.setattr(
+            "tools.mcp.context_evidence_memory_tools.handle_cdb_context_trust_summary",
+            lambda request: {
+                "tool": "cdb_context_trust_summary",
+                "status": "error",
+                "error": {
+                    "code": "adapter_config_error",
+                    "message": "SURREALDB_ENV not found",
+                },
+                "metadata": {
+                    "query_time_ms": 0,
+                    "source": "in_memory",
+                    "read_only": True,
+                },
+            },
+        )
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
             {
-                "task_id": "cdb-briefing-surrealdb-partial",
-                "task_scope": "Validate surrealdb-local partial claim mode.",
+                "task_id": "cdb-briefing-db-config-error",
+                "task_scope": "Validate fail-closed DB config handling.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "adapter_config_path": "infrastructure/config/surrealdb/context_query.local.example.yaml",
+            },
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "adapter_config_error"
+
+    def test_db_requested_briefing_fails_closed_on_unavailable_source(
+        self, monkeypatch
+    ) -> None:
+        """Soft-unavailable DB status still fails closed on briefing."""
+        monkeypatch.setattr(
+            "tools.mcp.context_evidence_memory_tools.handle_cdb_context_trust_summary",
+            lambda request: {
+                "tool": "cdb_context_trust_summary",
+                "status": "ok",
+                "result": {"scope": request["parameters"]["scope"]},
+                "metadata": {
+                    "query_time_ms": 0,
+                    "source": "surrealdb-local-unavailable",
+                    "read_only": True,
+                },
+            },
+        )
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-db-unavailable",
+                "task_scope": "Validate unavailable surrealdb claim mode.",
+                "target_issue": "#2607",
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+                "adapter_config_path": "infrastructure/config/surrealdb/context_query.local.example.yaml",
+            },
+        )
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "adapter_unavailable"
+
+    def test_caller_brain_source_is_ignored_without_db(self) -> None:
+        """Caller-supplied surrealdb-local claims cannot fake DB readiness."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-ignore-caller-brain-source",
+                "task_scope": "Validate caller claim suppression.",
                 "target_issue": "#2607",
                 "requested_depth": "quick",
                 "operation_mode": "read_only",
                 "brain_source": "surrealdb-local",
-                "brain_status": "partial",
-            },
-        )
-        session_context = result["briefing"]["session_context"]
-        assert session_context["agent_operating_mode"]["db_claims_allowed"] is True
-
-    def test_surrealdb_local_blocked_disables_db_claims(self) -> None:
-        """Blocked brain status fail-closes DB-backed claims."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.briefing",
-            {
-                "task_id": "cdb-briefing-surrealdb-blocked",
-                "task_scope": "Validate blocked surrealdb claim mode.",
-                "target_issue": "#2607",
-                "requested_depth": "quick",
-                "operation_mode": "read_only",
-                "brain_source": "surrealdb-local",
-                "brain_status": "blocked",
-            },
-        )
-        session_context = result["briefing"]["session_context"]
-        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
-
-    def test_surrealdb_local_not_used_disables_db_claims(self) -> None:
-        """Not-used surrealdb status fail-closes DB-backed claims."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.briefing",
-            {
-                "task_id": "cdb-briefing-surrealdb-not-used",
-                "task_scope": "Validate not-used surrealdb claim mode.",
-                "target_issue": "#2607",
-                "requested_depth": "quick",
-                "operation_mode": "read_only",
-                "brain_source": "surrealdb-local",
-                "brain_status": "not-used",
-            },
-        )
-        session_context = result["briefing"]["session_context"]
-        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
-
-    def test_repo_only_used_still_disables_db_claims(self) -> None:
-        """repo-only stays non-DB-backed even with a usable status string."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.briefing",
-            {
-                "task_id": "cdb-briefing-repo-only-used",
-                "task_scope": "Validate repo-only used claim mode.",
-                "target_issue": "#2607",
-                "requested_depth": "quick",
-                "operation_mode": "read_only",
-                "brain_source": "repo-only",
                 "brain_status": "used",
             },
         )
         session_context = result["briefing"]["session_context"]
+        assert session_context["brain_source"] == "repo-only"
         assert session_context["brain_status"] == "not-used"
         assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
-
-    def test_repo_only_used_status_is_coerced_to_not_used(self) -> None:
-        """repo-only cannot preserve an impossible used brain status."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.briefing",
-            {
-                "task_id": "cdb-briefing-repo-only-coerced-status",
-                "task_scope": "Validate repo-only brain status coercion.",
-                "target_issue": "#2607",
-                "requested_depth": "quick",
-                "operation_mode": "read_only",
-                "brain_source": "repo-only",
-                "brain_status": "used",
-            },
-        )
-        session_context = result["briefing"]["session_context"]
-        assert session_context["brain_status"] == "not-used"
         assert any(
-            "coerced to not-used" in item for item in session_context["limitations"]
+            "caller input ignored" in item for item in session_context["limitations"]
         )
-
-    def test_unavailable_used_status_is_coerced_to_blocked(self) -> None:
-        """Unavailable brain source cannot preserve a usable brain status."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.briefing",
-            {
-                "task_id": "cdb-briefing-unavailable-coerced-status",
-                "task_scope": "Validate unavailable brain status coercion.",
-                "target_issue": "#2607",
-                "requested_depth": "quick",
-                "operation_mode": "read_only",
-                "brain_source": "unavailable",
-                "brain_status": "used",
-            },
-        )
-        session_context = result["briefing"]["session_context"]
-        assert session_context["brain_status"] == "blocked"
-        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
-        assert any(
-            "coerced to blocked" in item for item in session_context["limitations"]
-        )
-
-    def test_malformed_brain_status_disables_db_claims(self) -> None:
-        """Malformed brain_status fail-closes DB-backed claims."""
-        bridge = create_bridge()
-        result = bridge.execute_tool(
-            "context.briefing",
-            {
-                "task_id": "cdb-briefing-bad-brain-status",
-                "task_scope": "Validate malformed brain_status claim mode.",
-                "target_issue": "#2607",
-                "requested_depth": "quick",
-                "operation_mode": "read_only",
-                "brain_source": "surrealdb-local",
-                "brain_status": "bad-status",
-            },
-        )
-        session_context = result["briefing"]["session_context"]
-        assert session_context["brain_status"] == "blocked"
-        assert session_context["agent_operating_mode"]["db_claims_allowed"] is False
 
     def test_repo_state_values_are_preserved_when_provided(self) -> None:
         """Caller-provided repo_state values are preserved."""
@@ -1808,8 +1789,8 @@ class TestContextBriefingHandler:
         )
         assert r1["briefing"]["briefing_id"] != r2["briefing"]["briefing_id"]
 
-    def test_brain_source_changes_briefing_id(self) -> None:
-        """Different brain_source values change briefing_id."""
+    def test_derived_brain_context_changes_briefing_id(self) -> None:
+        """Different derived brain contexts change briefing_id."""
         bridge = create_bridge()
         base = {
             "task_id": "cdb-briefing-hash-brain-source",
@@ -1818,11 +1799,15 @@ class TestContextBriefingHandler:
             "requested_depth": "quick",
             "operation_mode": "read_only",
         }
-        r1 = bridge.execute_tool(
-            "context.briefing", {**base, "brain_source": "repo-only"}
-        )
+        r1 = bridge.execute_tool("context.briefing", base)
         r2 = bridge.execute_tool(
-            "context.briefing", {**base, "brain_source": "in_memory"}
+            "context.briefing",
+            {
+                **base,
+                "memory_records": [
+                    {"memory_id": "mem-001", "scope": "wave14", "content": "test"}
+                ],
+            },
         )
         assert r1["briefing"]["briefing_id"] != r2["briefing"]["briefing_id"]
 
@@ -1889,8 +1874,6 @@ class TestContextBriefingHandler:
                 "related_prs": ["#2618"],
                 "open_epics": ["#2607"],
             },
-            "brain_source": "repo-only",
-            "brain_status": "not-used",
             "working_assumptions": ["assumption"],
             "limitations": ["limit", "limit"],
         }
@@ -1910,8 +1893,6 @@ class TestContextBriefingHandler:
                 "related_prs": ["#2618"],
                 "open_epics": ["#2607"],
             },
-            "brain_source": "repo-only",
-            "brain_status": "not-used",
             "working_assumptions": ["assumption"],
             "limitations": ["limit"],
         }
@@ -1973,8 +1954,6 @@ class TestContextBriefingHandler:
                 "target_issue": "#2607",
                 "requested_depth": "quick",
                 "operation_mode": "read_only",
-                "brain_source": "repo-only",
-                "brain_status": "not-used",
                 "repo_state": {
                     "branch": "fix/2613-noise-freeze-remaining-push-triggers",
                     "commit": "f345cf0c",
@@ -2277,8 +2256,8 @@ class TestContextBriefingHandler:
             assert "step" in step
             assert "method" in step
 
-    def test_missing_target_issue_returns_error(self) -> None:
-        """Missing target_issue key fails closed."""
+    def test_missing_target_issue_defaults_to_none(self) -> None:
+        """Missing target_issue key now defaults to null/None."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
@@ -2289,8 +2268,11 @@ class TestContextBriefingHandler:
                 "operation_mode": "read_only",
             },
         )
-        assert result["status"] == "error"
-        assert result["error"]["code"] == "invalid_target_issue"
+        assert result["status"] == "ok"
+        assert (
+            result["briefing"]["session_context"]["github_state"]["target_issue"]
+            is None
+        )
 
     def test_target_issue_null_is_ok(self) -> None:
         """target_issue: null (None) is explicitly allowed."""
@@ -2307,8 +2289,8 @@ class TestContextBriefingHandler:
         )
         assert result["status"] == "ok"
 
-    def test_missing_requested_depth_returns_error(self) -> None:
-        """Missing requested_depth key fails closed."""
+    def test_missing_requested_depth_defaults_to_quick(self) -> None:
+        """Missing requested_depth now defaults to quick."""
         bridge = create_bridge()
         result = bridge.execute_tool(
             "context.briefing",
@@ -2319,8 +2301,21 @@ class TestContextBriefingHandler:
                 "operation_mode": "read_only",
             },
         )
-        assert result["status"] == "error"
-        assert result["error"]["code"] == "invalid_depth"
+        explicit_quick = bridge.execute_tool(
+            "context.briefing",
+            {
+                "task_id": "cdb-briefing-test",
+                "task_scope": "Test scope.",
+                "target_issue": None,
+                "requested_depth": "quick",
+                "operation_mode": "read_only",
+            },
+        )
+        assert result["status"] == "ok"
+        assert (
+            result["briefing"]["briefing_id"]
+            == explicit_quick["briefing"]["briefing_id"]
+        )
 
     def test_missing_operation_mode_returns_error(self) -> None:
         """Missing operation_mode key fails closed."""
@@ -3776,3 +3771,103 @@ class TestWave14BridgeDispatch:
         assert result["status"] == "error"
         assert result["error"]["code"] == "unknown_tool"
         assert result["error"]["code"] != "not_implemented"
+
+    @staticmethod
+    def _minimal_payload(tool_name: str) -> dict[str, Any]:
+        if tool_name == "cdb_context_evidence_resolve":
+            return {
+                "mode": "by_artifact",
+                "artifact": "tools/surrealdb/evidence_lookup.py",
+                "evidence_records": [
+                    {
+                        "evidence_id": "ev_test_1",
+                        "evidence_type": "test_run",
+                        "confidence": 0.8,
+                        "artifact_refs": ["tools/surrealdb/evidence_lookup.py"],
+                        "claim_refs": [],
+                        "decision_refs": [],
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_claim_resolve":
+            return {
+                "mode": "by_topic",
+                "topic": "context_tools",
+                "claim_records": [
+                    {
+                        "claim_id": "claim_test_1",
+                        "title": "Test claim",
+                        "statement": "read-only claim",
+                        "status": "supported",
+                        "scope": "wave14",
+                        "topic": "context_tools",
+                        "evidence_refs": [],
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_memory_get":
+            return {
+                "mode": "by_scope",
+                "scope": "wave14",
+                "memory_records": [
+                    {
+                        "memory_id": "mem_test_1",
+                        "scope": "wave14",
+                        "memory_type": "constraint",
+                        "content": "read-only memory",
+                        "agent": "bridge-test",
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_trust_summary":
+            return {"scope": "wave14"}
+        if tool_name == "cdb_context_decision_history":
+            return {
+                "mode": "by_topic",
+                "topic": "context_tools",
+                "decision_events": [
+                    {
+                        "decision_id": "dec_test_1",
+                        "title": "Decision",
+                        "topic": "context_tools",
+                        "scope": "wave14",
+                        "status": "approved",
+                    }
+                ],
+            }
+        if tool_name == "cdb_context_decision_replay":
+            return {
+                "mode": "replay_by_scope",
+                "scope": "wave14",
+                "decision_events": [
+                    {
+                        "decision_id": "dec_test_1",
+                        "title": "Decision",
+                        "topic": "context_tools",
+                        "scope": "wave14",
+                        "status": "approved",
+                    }
+                ],
+            }
+        raise AssertionError(f"Unhandled Wave-14 tool: {tool_name}")
+
+    @pytest.mark.parametrize("tool_name", _WAVE14_TOOLS)
+    def test_forged_db_claim_fields_do_not_change_in_memory_source(
+        self, tool_name: str
+    ) -> None:
+        """Bridge-level dispatch must not let caller fields fake DB-backed mode."""
+        bridge = create_bridge()
+        result = bridge.execute_tool(
+            tool_name,
+            {
+                **self._minimal_payload(tool_name),
+                "source": "surrealdb-local",
+                "brain_source": "surrealdb-local",
+                "brain_status": "used",
+                "metadata": {"source": "surrealdb-local"},
+            },
+        )
+
+        assert result.get("error", {}).get("code") != "not_implemented"
+        assert result.get("metadata", {}).get("read_only") is True
+        assert result.get("metadata", {}).get("source") == "in_memory"
